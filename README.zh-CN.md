@@ -35,13 +35,44 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 
 ## 安装（独立仓）
 
-本插件以独立仓发布——用 Hermes 插件管理器安装，无需手工拷贝文件：
+本插件以独立仓发布——用 Hermes 插件管理器安装，无需手工拷贝文件。
+
+### 前置要求
+
+- **Hermes v0.22.2 或更新**——下述插件依赖同意流程自该版本起提供。
+- **一个 OneBot 11 桥**（NapCat / Lagrange / LLOneBot / go-cqhttp），Hermes 可达且指向本插件的监听地址（reverse WS 由桥拨入 `host:port`；forward WS 由插件拨出），桥的 access token 与插件 `access_token` 一致。操作步骤见下方「配置 Hermes」与「NapCat 侧配置（必做）」两节。
+
+### 安装
 
 ```
 hermes plugins install https://github.com/mario841859784/hermes-plugin-onebot.git
 ```
 
-走代理时按惯例加 `HTTPS_PROXY=...` 前缀。Python 依赖已在 `plugin.yaml` 里声明（`python_dependencies: ["fonttools>=4,<5"]`），由插件加载器自动安装——仅长回复的文字转图（t2i）档位需要（渲染卡片所需的 CJK 系统字体见下方「字体依赖」）。无需手工 pip。
+走代理时按惯例加 `HTTPS_PROXY=...` 前缀。
+
+**Python 依赖与同意门。** 依赖已在 `plugin.yaml` 声明（`python_dependencies: ["fonttools>=4,<5"]`）——仅长回复的文字转图（t2i）档位需要（渲染卡片所需的 CJK 系统字体见下方「字体依赖」）。交互终端下安装器会先列出依赖清单并征求 `y/N` 同意，同意后装入 Hermes 的 **pm 共享环境**（网关运行时所在环境），不是插件自己的目录。无需手工 pip。
+
+**无头 / SSH（非交互）。** 加 `--yes-deps` 预先替你回答依赖问题：
+
+```
+hermes plugins install --yes-deps https://github.com/mario841859784/hermes-plugin-onebot.git
+```
+
+不带 `--yes-deps` 时，非交互安装会**装上插件但保持 disabled**——绝不静默安装依赖（fail-closed）。交互下对 `y/N` 回答 `n` 结果相同；之后用 `hermes plugins enable onebot-platform` 补完安装。
+
+### 更新
+
+- **交互环境**：`hermes plugins update onebot-platform` 拉取最新版本。若新版本声明了此前没有的 Python 依赖，会再次过同一道 `y/N` 同意门——无人值守的 update 若会新增依赖会被直接拒绝，绝不代你同意。
+- **pinned 安装**（用 `--ref <sha>` 安装）会拒绝 `update`，报错会给出挪动 pin 的 `install --force --ref <sha>` 命令。无头环境用同 URL 重装即可：`hermes plugins install --yes-deps --force https://github.com/mario841859784/hermes-plugin-onebot.git`（要继续钉住某个 commit，再加 `--ref <40位commit SHA>`）。
+
+### 验证
+
+```
+hermes plugins list        # onebot-platform 应显示 enabled 状态 + 版本号
+hermes plugins validate ~/.hermes/plugins/onebot-platform   # 插件自查（路径 = 已安装插件目录）
+```
+
+网关加载时若发现声明的依赖缺失，加载器会打 **WARNING**（指明缺失的包并提示 `hermes pm repair` 修复）——不会静默坏。发现（discovery）阶段从不安装依赖；修复或重装才会装。
 
 维护者：**mario841859784**
 

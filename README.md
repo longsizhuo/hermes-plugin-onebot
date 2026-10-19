@@ -37,13 +37,44 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 
 ## Install (standalone repo)
 
-This plugin lives in its own repo — install it with the Hermes plugin manager instead of copying files by hand:
+This plugin lives in its own repo — install it with the Hermes plugin manager instead of copying files by hand.
+
+### Prerequisites
+
+- **Hermes v0.22.2 or newer** — the plugin dependency consent flow described below is part of that release.
+- **A OneBot 11 bridge** (NapCat / Lagrange / LLOneBot / go-cqhttp) that Hermes can reach and that points at this plugin's listener (reverse WS dials into `host:port`; forward WS dials out), with the bridge's access token matching the plugin's `access_token`. Walk-through: the *Configure Hermes* and *NapCat-side setup* sections below.
+
+### Installing
 
 ```
 hermes plugins install https://github.com/mario841859784/hermes-plugin-onebot.git
 ```
 
-Prefix with `HTTPS_PROXY=...` when behind a proxy, as usual. Python dependencies are declared in `plugin.yaml` (`python_dependencies: ["fonttools>=4,<5"]`) and installed automatically by the plugin loader — only the text-to-image tier of long replies needs it (CJK system fonts for the rendered cards: see *Font dependencies* below). No manual pip steps.
+Prefix with `HTTPS_PROXY=...` when behind a proxy, as usual.
+
+**Python dependencies & the consent gate.** Dependencies are declared in `plugin.yaml` (`python_dependencies: ["fonttools>=4,<5"]`) — only the text-to-image tier of long replies needs it (CJK system fonts for the rendered cards: see *Font dependencies* below). On an interactive terminal the installer lists them and asks `y/N` before installing anything; what you accept goes into Hermes' **shared PM environment** (the environment the gateway itself runs on), not into the plugin's own directory. No manual pip steps.
+
+**Headless / SSH (non-interactive).** Pass `--yes-deps` to answer the dependency question up front:
+
+```
+hermes plugins install --yes-deps https://github.com/mario841859784/hermes-plugin-onebot.git
+```
+
+Without `--yes-deps`, a non-interactive install **leaves the plugin installed but disabled** — dependencies are never pulled in silently (fail-closed). Declining the `y/N` interactively lands in the same state; finish the install later with `hermes plugins enable onebot-platform`.
+
+### Updating
+
+- **Interactive**: `hermes plugins update onebot-platform` pulls the latest revision. If the new version declares Python dependencies the old one didn't, the same `y/N` consent gate runs again — an unattended update that would add dependencies is refused rather than consented on your behalf.
+- **Pinned checkouts** (installed with `--ref <sha>`) refuse `update`; the error prints the `install --force --ref <sha>` command that moves the pin. In a headless environment, reinstall the same URL instead: `hermes plugins install --yes-deps --force https://github.com/mario841859784/hermes-plugin-onebot.git` (add `--ref <40-character commit SHA>` to stay pinned).
+
+### Verify
+
+```
+hermes plugins list        # onebot-platform should show status "enabled" + its version
+hermes plugins validate ~/.hermes/plugins/onebot-platform   # self-check (path = installed plugin dir)
+```
+
+If a declared dependency is missing when the gateway loads, the loader logs a **WARNING** naming the package (and `hermes pm repair` as the fix) — it does not fail silently. Plugin discovery never installs dependencies; a repair or reinstall does.
 
 Maintained by **mario841859784**.
 
