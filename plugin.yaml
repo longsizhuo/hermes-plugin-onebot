@@ -1,7 +1,7 @@
 name: onebot-platform
 label: QQ (OneBot)
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   QQ bot via the OneBot 11 protocol — compatible with NapCat, Lagrange,
   LLOneBot, go-cqhttp. Reverse-WebSocket server or forward client mode;
@@ -20,6 +20,11 @@ provides_tools:
   - qq_send_forward
   - qq_napcat_api
   - qq_group_history
+# T11 review #7: declared so the plugin loader installs it — no manual pip
+# step. Only needed by the text-to-image tier of long replies (fontTools
+# subsetter for CJK card rendering).
+python_dependencies:
+  - "fonttools>=4,<5"
 optional_env:
   - name: ONEBOT_ALLOWED_USERS
     description: "Comma-separated QQ user ids allowed to talk to the bot"

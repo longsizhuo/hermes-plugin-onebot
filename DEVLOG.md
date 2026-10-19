@@ -463,3 +463,31 @@ onebot 插件自 hermes-agent fork 插件线（feat/onebot-platform-v0.22.2，�
 - in-tree 导入（plugins.platforms.onebot.*）适配为包形态 onebot_platform.*：tests/conftest.py 以生产 loader 同款机制（`spec_from_file_location` + `submodule_search_locations`，对应 hermes_cli/plugins_loader.py::_load_directory_module）从仓根 __init__.py 装配包，相对导入生效；HERMES_HOME/HOME 每用例重定向 tmp_path，不触真实 ~/.hermes/。
 - 关键发现：仓根裸导入形态（sys.path 加仓根后 `import tools`）不可用——gateway/platforms/base.py:424 在模块导入期把 hermes-agent 根重新插到 sys.path[0]，其链上模块绑定 core `tools` 包，与插件根级 tools.py 在 sys.modules['tools'] 键上冲突（8 个 test_tools_* 失败）。包形态与生产 hermes_plugins.onebot_platform 命名空间同构，天然隔离。
 - 运行方式：`cd tests && HERMES_AGENT_HOME=<hermes-agent 检出> python -m pytest test_onebot_platform.py`（钉版 venv：pytest 9.1.1 / pytest-asyncio 1.3.0；从仓根跑会触发 pytest 9 对根 Package 节点 __init__.py 的导入而失败——连字符目录名使包名解析退化为顶层 `__init__`，相对导入报错，仅影响本地开发跑法，不影响 loader 安装态）。136 passed。
+
+## 16. T11：Teknium review 8 项安全加固（2026-10-19，v1.2.0）
+
+上游 reviewer（Teknium）对 PR（hermes-agent#140979 catalog 收录）给出 CHANGES_REQUESTED 8 项，本节逐项落地；版本 1.1.0→1.2.0（PLUGIN_VERSION 同步，/ver 输出随之更新）。提交拆四个逻辑 commit（e6745b4 → 5fa6a34 → 2f30b46 → 本条），全程生产零触碰。
+
+### Review 逐项处置
+
+| # | review 意见 | 落点 | 处置 |
+|---|---|---|---|
+| 1 | 本地文件读取一律过 media-delivery validator | adapter.py `_file_to_base64(gate=True)`；send_image_file / send_multiple_images / send_voice / send_video / send_document 五个出站读取点全部 gate；/api/send_media 图片分支对每个本地 source 预校验（拒绝整单 403，不静默丢弃）；adapter.send() 附件循环同 gate | 入站（vision/OCR）读取不过闸（review 只指出站）；拒绝记 WARNING `[onebot] outbound media read blocked by media-delivery validator`；错误串 `* rejected (media-delivery validator denylist), too large, or unreadable` |
+| 2 | tools.py chat_id 越权 | tools.py `_session_chat()` 随 /api/send_media 载荷透传会话上下文（工具层无会话角色，判定下沉 adapter）；adapter `_authorize_cross_chat_send()`：无会话（CLI/cron）放行、目标=当前会话放行、目标=ONEBOT_HOME_CHANNEL 放行、private 会话且 QQ ∈ admin_users 放行，其余 403 拒绝 | 群会话无法归因用户 → fail-closed 拒绝；拒绝记 WARNING `[onebot] cross-chat send denied: session=%s target=%s`；qq_napcat_api / qq_group_history 不在 scope（只读/白名单内） |
+| 3 | napcat 白名单 upload_group_file/upload_private_file | 保留白名单（功能优先），`_handle_napcat_api` 对这两个 action 的 params.file 做 validator 校验：拒绝 403 `file rejected: local path is not permitted…`，通过则替换为 resolved path | 与 #1 同一 denylist 语义 |
+| 4 | 反向/正向 WS 非 loopback 裸奔 | adapter `_validate_bind_security()`：非 loopback host 且 access_token 为空 → raise（`refusing to bind non-loopback host … without access_token`），_start_reverse_server 与 _start_api_server 入口各调一次；connect() 捕获记 ERROR 返回 False（fail-start） | 原 WARNING 降级测试删除，改为 raise 断言；README/README.zh-CN 安全段改为「非 loopback 必须 token，拒绝启动」 |
+| 5 | 凭证走 secret_scope | adapter 新模块函数 `_standalone_access_token(extra)`：agent.secret_scope.get_secret("ONEBOT_ACCESS_TOKEN") 优先，异常/为空回落 extra.access_token；tools.py `_access_token()` 同源改造；plugin.yaml optional_env 声明 ONEBOT_ACCESS_TOKEN（password: true） | 无 scope 且未开 multiplex 时 get_secret 读 os.environ → 纯 env 部署行为不变；UnscopedSecretError 场景回落 config |
+| 6 | 工具英文优先 | tools.py 全部 handler 结果/错误串、_schemas() 属性描述、_DESCRIPTIONS 改英文（关键结果附一行中文）；相应更新断言中文串的既有测试 | 例：`Sent (message_id=…) / 已发送`、`Send failed: …`、`action … is not whitelisted. Allowed: …` |
+| 7 | python_dependencies | plugin.yaml `python_dependencies: ["fonttools>=4,<5"]`；README/README.zh-CN 安装节改为「loader 自动安装，无需手工 pip」 | |
+| 8 | /tmp 状态与媒体迁 plugin-data | 新模块函数 `_plugin_data_dir()`=$HERMES_HOME/plugin-data/onebot-platform/、`_media_dir()`（media/ 子目录）、`_ensure_media_dir()`；7 处 /tmp/hermes_onebot 写点全部改 `_ensure_media_dir()`；onebot_nicknames.json / onebot_requests.json 迁入同目录；`_cleanup_tmp_files` 同时清扫新 media 目录与旧 /tmp/hermes_onebot（旧目录只读兼容） | 一次性迁移 `_migrate_legacy_state_file()`：旧位置存在且新位置缺失时 copy2（copy 不 move，旧文件保留作回滚备份），失败降级为新文件起步不 raise；媒体不迁移（瞬态，6h 清扫） |
+| — | 非阻塞：私有导入 _AUDIO_EXTS | 移除 `from gateway.platforms.base import _AUDIO_EXTS`，插件自带 `_AUDIO_MIME_TYPES`/`_AUDIO_EXTS`（与 base.py 手工同步） | 顺带消除 validator caution |
+
+### 兼容性说明
+
+- 状态迁移只在「新位置缺失」时发生，升级后首次触碰（构造 /approve 或昵称写盘）自动迁移；回滚 1.1.x 后旧文件仍在，无状态丢失窗口。
+- /api/send_media 载荷新增 session_chat 字段：旧工具（1.1.x tools.py）不带该字段 → adapter 视为无会话上下文放行，向后兼容。
+- get_secret 缺失（旧 hermes-agent 无 secret_scope 模块）→ ImportError 走回落链，行为同 1.1.x。
+
+### 测试
+
+新增 28 用例（媒体过闸 10、chat_id 越权 7、绑定安全+secret 7、plugin-data 迁移与清扫 5，含 conftest 平台注册修复），断言中文串的既有用例同步更新；`cd tests && HERMES_AGENT_HOME=<hermes-agent> python -m pytest test_onebot_platform.py`：**165 passed**（基线 136）。conftest 补丁说明：T9 后仓内捆绑 stub 目录已清空，Platform("onebot") 无法经捆绑目录扫描解析，改为按生产 loader 语义在 conftest 注册 PlatformEntry（production-mirror，非测试专用 hack）。

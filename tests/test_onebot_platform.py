@@ -1379,8 +1379,11 @@ def test_inbound_file_falls_back_to_get_file_base64(monkeypatch) -> None:
 
     asyncio.run(run())
     assert "[文件:" in captured[0].text
-    # adapter 落盘目录随平台（Windows 是 %LOCALAPPDATA%\Temp），用 gettempdir() 断言
-    assert str(Path(tempfile.gettempdir()) / "hermes_onebot") in captured[0].text
+    # T11 review #8: 入站文件落盘在 $HERMES_HOME/plugin-data/onebot-platform/media/
+    assert (
+        str(Path(os.environ["HERMES_HOME"]) / "plugin-data" / "onebot-platform" / "media")
+        in captured[0].text
+    )
 
 
 def test_inbound_file_download_failure_keeps_name(monkeypatch) -> None:
@@ -1477,7 +1480,7 @@ def test_tools_send_image_builds_media_request(monkeypatch) -> None:
     out = tools.qq_send_image(
         {"sources": ["/tmp/a.png", "https://x/y.jpg"], "chat_id": "private:123456789"}
     )
-    assert "已发送" in out
+    assert "Sent" in out
     assert calls[0][0] == "POST"
     assert calls[0][1] == "/api/send_media"
     assert calls[0][2]["kind"] == "image"
@@ -1501,7 +1504,7 @@ def test_tools_napcat_api_whitelist_guard(monkeypatch) -> None:
     monkeypatch.setattr(tools, "_http", fake_http)
     # 白名单外直接拒绝，不发请求
     out = tools.qq_napcat_api({"action": "set_group_kick"})
-    assert "不在白名单" in out
+    assert "not whitelisted" in out
     assert not calls
     # 白名单内正常代理
     out = tools.qq_napcat_api({"action": "get_group_member_list", "params": {"group_id": 88888}})
@@ -1590,8 +1593,8 @@ def test_tools_carry_bearer_token_when_configured(monkeypatch) -> None:
         )
     finally:
         srv.stop()
-    assert "已发送" in out_img
-    assert "调用失败" not in out_nap
+    assert "Sent" in out_img
+    assert "Call failed" not in out_nap
     assert len(srv.seen) == 2
     by_path = {s["path"].split("?", 1)[0]: s for s in srv.seen}
     assert by_path["/api/send_media"]["method"] == "POST"
@@ -1622,7 +1625,7 @@ def test_tools_send_no_authorization_without_token(monkeypatch) -> None:
         )
     finally:
         srv.stop()
-    assert "已发送" in out
+    assert "Sent" in out
     assert len(srv.seen) == 1
     assert srv.seen[0]["authorization"] is None
 
@@ -1695,8 +1698,8 @@ def test_tools_e2e_token_against_api_gate(monkeypatch) -> None:
         return out_hist, out_img
 
     out_hist, out_img = asyncio.run(run())
-    assert "拉取失败" not in out_hist and out_hist, f"group_history 应成功：{out_hist}"
-    assert "已发送" in out_img
+    assert "Fetch failed" not in out_hist and out_hist, f"group_history 应成功：{out_hist}"
+    assert "Sent" in out_img
     assert set(calls) == {"get_group_msg_history"}
 
 
@@ -1893,7 +1896,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.0.0" in t for t in texts)
+    assert any("onebot-plugin v1.2.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -2869,7 +2872,8 @@ def test_requests_persist_across_restart(monkeypatch, tmp_path) -> None:
     """台账落盘：重启（新实例）后 /approve 仍可用，seq 续增。"""
     adapter1 = _make_request_adapter(monkeypatch, tmp_path)
     asyncio.run(_dispatch_request_and_collect(adapter1, _friend_request_frame()))
-    persist_path = tmp_path / "onebot_requests.json"
+    # T11 review #8: 台账迁到 $HERMES_HOME/plugin-data/onebot-platform/
+    persist_path = Path(adapter1._requests_file())
     assert persist_path.exists()
     # 敏感文件权限：仅属主可读写
     assert (persist_path.stat().st_mode & 0o777) == 0o600
@@ -2982,7 +2986,7 @@ def test_requests_file_created_0600_without_chmod(monkeypatch, tmp_path) -> None
 
     monkeypatch.setattr(_os, "chmod", _no_chmod)
     adapter._persist_requests()  # 不抛错即通过
-    persist_path = tmp_path / "onebot_requests.json"
+    persist_path = Path(adapter._requests_file())
     assert persist_path.exists()
     assert (persist_path.stat().st_mode & 0o777) == 0o600
 
@@ -3989,3 +3993,118 @@ def test_tools_token_via_secret_scope(monkeypatch) -> None:
 
     monkeypatch.setattr(ss, "get_secret", boom)
     assert tools._access_token() in ("", None) or isinstance(tools._access_token(), str)
+
+
+# ---------------------------------------------------------------------------
+# T11 review #8: plugin-data relocation + one-time state migration
+# ---------------------------------------------------------------------------
+
+def _legacy_state_paths() -> "tuple[Path, Path]":
+    home = Path(os.environ["HERMES_HOME"])
+    return home / "onebot_nicknames.json", home / "onebot_requests.json"
+
+
+def _plugin_state_paths() -> "tuple[Path, Path]":
+    from onebot_platform import adapter as adapter_module
+
+    root = adapter_module._plugin_data_dir()
+    return root / "onebot_nicknames.json", root / "onebot_requests.json"
+
+
+def test_state_files_migrate_from_legacy_location() -> None:
+    """#8: v1.1.x 状态文件首次触碰时一次性迁移到 plugin-data，旧文件保留。"""
+    import onebot_platform.adapter as adapter_module
+
+    legacy_nick, legacy_req = _legacy_state_paths()
+    legacy_nick.parent.mkdir(parents=True, exist_ok=True)
+    legacy_nick.write_text(
+        json.dumps({"private:111": "Alice"}, ensure_ascii=False), encoding="utf-8"
+    )
+    legacy_req.write_text(
+        json.dumps(
+            {"requests": [{"flag": "F11", "seq": 11, "status": "pending"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    adapter = _make_adapter(admin_users=[111])
+    new_nick, new_req = _plugin_state_paths()
+
+    # 迁移发生：新文件存在、内容一致、旧文件保留作回滚备份
+    assert new_nick.is_file()
+    assert json.loads(new_nick.read_text(encoding="utf-8")) == {"private:111": "Alice"}
+    assert legacy_nick.is_file()
+    assert adapter._nicknames == {"private:111": "Alice"}
+
+    assert new_req.is_file()
+    assert "F11" in adapter._requests
+    assert adapter._request_seq == 11
+    assert legacy_req.is_file()
+
+
+def test_state_files_new_location_wins_over_legacy() -> None:
+    """#8: 新旧同时存在 → 以新文件为准，迁移不得覆盖新文件。"""
+    legacy_nick, _ = _legacy_state_paths()
+    legacy_nick.parent.mkdir(parents=True, exist_ok=True)
+    legacy_nick.write_text(
+        json.dumps({"private:111": "Legacy"}, ensure_ascii=False), encoding="utf-8"
+    )
+    new_nick, _ = _plugin_state_paths()
+    new_nick.parent.mkdir(parents=True, exist_ok=True)
+    new_nick.write_text(
+        json.dumps({"private:222": "Fresh"}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    adapter = _make_adapter(admin_users=[111])
+    assert adapter._nicknames == {"private:222": "Fresh"}
+
+
+def test_state_files_persist_to_plugin_data_dir() -> None:
+    """#8: 全新部署只写新路径，不再在 HERMES_HOME 根下落状态文件。"""
+    adapter = _make_adapter(admin_users=[1])
+    adapter._nicknames["private:9"] = "Bob"
+    adapter._persist_nicknames()
+
+    new_nick, _ = _plugin_state_paths()
+    legacy_nick, _ = _legacy_state_paths()
+    assert new_nick.is_file()
+    assert json.loads(new_nick.read_text(encoding="utf-8"))["private:9"] == "Bob"
+    assert not legacy_nick.exists()
+
+
+def test_media_files_written_under_plugin_data_dir() -> None:
+    """#8: 媒体下载落 $HERMES_HOME/plugin-data/onebot-platform/media/。"""
+    import onebot_platform.adapter as adapter_module
+
+    adapter = _make_adapter(admin_users=[1])
+    d = adapter_module._ensure_media_dir()
+    assert d == Path(os.environ["HERMES_HOME"]) / "plugin-data" / "onebot-platform" / "media"
+    assert d.is_dir()
+
+
+def test_cleanup_tmp_files_sweeps_legacy_tmp_dir(monkeypatch) -> None:
+    """#8: 清扫同时覆盖新 media 目录与旧 /tmp/hermes_onebot（只读兼容）。"""
+    import onebot_platform.adapter as adapter_module
+
+    fake_legacy = Path(os.environ["HERMES_HOME"]) / "legacy_tmp"
+    fake_legacy.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(adapter_module, "_legacy_tmp_dir", lambda: fake_legacy)
+
+    adapter = _make_adapter(admin_users=[1])
+    media = adapter_module._ensure_media_dir()
+
+    old = media / "img_old.jpg"
+    old.write_bytes(b"x")
+    os.utime(old, (time.time() - 99999, time.time() - 99999))
+    keep = media / "img_new.jpg"
+    keep.write_bytes(b"y")
+
+    legacy_old = fake_legacy / "voice_old.wav"
+    legacy_old.write_bytes(b"z")
+    os.utime(legacy_old, (time.time() - 99999, time.time() - 99999))
+
+    adapter._cleanup_tmp_files(max_age=3600)
+    assert not old.exists()
+    assert keep.exists()
+    assert not legacy_old.exists()

@@ -52,7 +52,8 @@ def _resolve_chat(chat_id: Optional[str]) -> str:
         if session_chat:
             return session_chat
     raise ValueError(
-        "无法确定目标会话：请传 chat_id（格式 private:<qq> 或 group:<群号>）"
+        "Cannot determine target chat: pass chat_id explicitly "
+        "(format private:<qq> or group:<gid>) / 无法确定目标会话：请传 chat_id"
     )
 
 
@@ -132,8 +133,8 @@ def _http(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> D
 def _media_result(resp: Dict[str, Any]) -> str:
     if resp.get("ok"):
         mid = resp.get("message_id")
-        return "已发送" + (f"（message_id={mid}）" if mid else "")
-    return "发送失败：" + str(resp.get("error") or "未知错误")
+        return "Sent" + (f" (message_id={mid})" if mid else "") + " / 已发送"
+    return "Send failed: " + str(resp.get("error") or "unknown error") + " / 发送失败"
 
 
 # ---------------------------------------------------------------------------
@@ -146,9 +147,9 @@ def qq_send_image(args: Dict[str, Any], **kw) -> str:
     sources = args.get("sources") or []
     sources = [s for s in sources if isinstance(s, str) and s]
     if not sources:
-        return "qq_send_image: sources 不能为空"
+        return "qq_send_image: sources must not be empty / sources 不能为空"
     if len(sources) > 9:
-        return "qq_send_image: 一次最多 9 张图片"
+        return "qq_send_image: at most 9 images per call / 一次最多 9 张图片"
     chat_id = _resolve_chat(args.get("chat_id"))
     resp = _http(
         "POST",
@@ -161,7 +162,7 @@ def qq_send_image(args: Dict[str, Any], **kw) -> str:
 def qq_send_voice(args: Dict[str, Any], **kw) -> str:
     path = args.get("path") or ""
     if not path:
-        return "qq_send_voice: path 必填"
+        return "qq_send_voice: path is required / path 必填"
     chat_id = _resolve_chat(args.get("chat_id"))
     resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "voice", "path": path, "session_chat": _session_chat()})
     return _media_result(resp)
@@ -170,7 +171,7 @@ def qq_send_voice(args: Dict[str, Any], **kw) -> str:
 def qq_send_video(args: Dict[str, Any], **kw) -> str:
     path = args.get("path") or ""
     if not path:
-        return "qq_send_video: path 必填"
+        return "qq_send_video: path is required / path 必填"
     chat_id = _resolve_chat(args.get("chat_id"))
     resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "video", "path": path, "session_chat": _session_chat()})
     return _media_result(resp)
@@ -179,7 +180,7 @@ def qq_send_video(args: Dict[str, Any], **kw) -> str:
 def qq_send_file(args: Dict[str, Any], **kw) -> str:
     path = args.get("path") or ""
     if not path:
-        return "qq_send_file: path 必填"
+        return "qq_send_file: path is required / path 必填"
     chat_id = _resolve_chat(args.get("chat_id"))
     resp = _http(
         "POST",
@@ -199,7 +200,7 @@ def qq_send_forward(args: Dict[str, Any], **kw) -> str:
     """Send a merged forward (QQ chat bubble) with named node messages."""
     nodes = args.get("nodes") or []
     if not isinstance(nodes, list) or not nodes:
-        return "qq_send_forward: nodes 不能为空（[{name, content}, ...]）"
+        return "qq_send_forward: nodes must not be empty ([{name, content}, ...]) / nodes 不能为空"
     chat_id = _resolve_chat(args.get("chat_id"))
     cleaned = []
     for n in nodes:
@@ -208,7 +209,7 @@ def qq_send_forward(args: Dict[str, Any], **kw) -> str:
                 {"name": str(n.get("name") or "Hermes"), "content": str(n.get("content") or "")}
             )
     if not cleaned:
-        return "qq_send_forward: nodes 为空"
+        return "qq_send_forward: no valid nodes / 未提供有效节点"
     resp = _http(
         "POST",
         "/api/send_media",
@@ -222,24 +223,25 @@ def qq_napcat_api(args: Dict[str, Any], **kw) -> str:
     action = str(args.get("action") or "")
     if action not in NAPCAT_API_WHITELIST:
         return (
-            f"action {action!r} 不在白名单。可用："
+            f"action {action!r} is not whitelisted. Allowed: "
             + ", ".join(NAPCAT_API_WHITELIST)
+            + " / 不在白名单"
         )
     params = args.get("params") or {}
     if not isinstance(params, dict):
-        return "qq_napcat_api: params 必须是对象"
+        return "qq_napcat_api: params must be an object / params 必须是对象"
     qs = urllib.parse.urlencode({"action": action, "params": json.dumps(params)})
     resp = _http("GET", f"/api/napcat?{qs}")
     if resp.get("ok"):
         return json.dumps(resp.get("data"), ensure_ascii=False)[:4000]
-    return "调用失败：" + str(resp.get("error") or "未知错误")
+    return "Call failed: " + str(resp.get("error") or "unknown error") + " / 调用失败"
 
 
 def qq_group_history(args: Dict[str, Any], **kw) -> str:
     """Pull recent messages from a group (summary / monitoring)."""
     group_id = args.get("group_id") or ""
     if not group_id:
-        return "qq_group_history: group_id 必填"
+        return "qq_group_history: group_id is required / group_id 必填"
     count = int(args.get("count") or 20)
     count = max(1, min(count, 50))
     qs = urllib.parse.urlencode(
@@ -248,7 +250,7 @@ def qq_group_history(args: Dict[str, Any], **kw) -> str:
     resp = _http("GET", f"/api/group_history?{qs}")
     if resp.get("ok"):
         return json.dumps(resp.get("data"), ensure_ascii=False)[:8000]
-    return "拉取失败：" + str(resp.get("error") or "未知错误")
+    return "Fetch failed: " + str(resp.get("error") or "unknown error") + " / 拉取失败"
 
 
 _HANDLERS: Dict[str, Any] = {
@@ -272,7 +274,7 @@ def _str_prop(name: str, desc: str, required: bool = False) -> Dict[str, Any]:
 def _schemas() -> Dict[str, Dict[str, Any]]:
     chat_id = {
         "type": "string",
-        "description": "目标会话，格式 private:<qq> 或 group:<群号>；省略时默认当前会话",
+        "description": "Target chat id, format private:<qq> or group:<gid>; omit to use the current session (目标会话，省略时默认当前会话)",
     }
     return {
         "qq_send_image": {
@@ -281,17 +283,17 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
                 "sources": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "图片来源：本地绝对路径或 http(s) URL，最多 9 个",
+                    "description": "Image sources: local absolute paths or http(s) URLs, max 9 (图片来源，最多 9 个)",
                 },
                 "chat_id": chat_id,
-                "caption": {"type": "string", "description": "图片说明文字（可选，作为图片前的文本）"},
+                "caption": {"type": "string", "description": "Optional caption text sent before the images (图片说明文字，可选)"},
             },
             "required": ["sources"],
         },
         "qq_send_voice": {
             "type": "object",
             "properties": {
-                "path": _str_prop("path", "本地音频文件绝对路径（mp3/wav/silk 等）", required=True),
+                "path": _str_prop("path", "Absolute path of a local audio file (mp3/wav/silk etc.) (本地音频文件绝对路径)", required=True),
                 "chat_id": chat_id,
             },
             "required": ["path"],
@@ -299,7 +301,7 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
         "qq_send_video": {
             "type": "object",
             "properties": {
-                "path": _str_prop("path", "本地视频文件绝对路径", required=True),
+                "path": _str_prop("path", "Absolute path of a local video file (本地视频文件绝对路径)", required=True),
                 "chat_id": chat_id,
             },
             "required": ["path"],
@@ -307,8 +309,8 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
         "qq_send_file": {
             "type": "object",
             "properties": {
-                "path": _str_prop("path", "本地文件绝对路径", required=True),
-                "file_name": _str_prop("file_name", "发送时显示的文件名（可选）"),
+                "path": _str_prop("path", "Absolute path of a local file (本地文件绝对路径)", required=True),
+                "file_name": _str_prop("file_name", "Display name shown when sending (optional) (发送时显示的文件名，可选)"),
                 "chat_id": chat_id,
             },
             "required": ["path"],
@@ -321,11 +323,11 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": _str_prop("name", "节点昵称"),
-                            "content": _str_prop("content", "节点文本内容"),
+                            "name": _str_prop("name", "Node display name (节点昵称)"),
+                            "content": _str_prop("content", "Node text content (节点文本内容)"),
                         },
                     },
-                    "description": "合并转发节点列表，每个 {name, content}；仿 QQ 聊天记录",
+                    "description": "Merged-forward node list, each {name, content}; mimics a QQ chat-history card (合并转发节点列表，仿 QQ 聊天记录)",
                 },
                 "chat_id": chat_id,
             },
@@ -336,19 +338,19 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "白名单 action："
+                    "description": "Whitelisted action, one of: "
                     + ", ".join(NAPCAT_API_WHITELIST),
                 },
-                "params": {"type": "object", "description": "action 参数对象"},
+                "params": {"type": "object", "description": "Action argument object (action 参数对象)"},
             },
             "required": ["action"],
         },
         "qq_group_history": {
             "type": "object",
             "properties": {
-                "group_id": _str_prop("group_id", "群号", required=True),
-                "count": {"type": "integer", "description": "拉取条数（1-50，默认 20）"},
-                "message_seq": {"type": "integer", "description": "翻页游标（可选）"},
+                "group_id": _str_prop("group_id", "Group id (群号)", required=True),
+                "count": {"type": "integer", "description": "Number of messages to pull (1-50, default 20) (拉取条数)"},
+                "message_seq": {"type": "integer", "description": "Pagination cursor (optional) (翻页游标，可选)"},
             },
             "required": ["group_id"],
         },
@@ -356,13 +358,13 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
 
 
 _DESCRIPTIONS = {
-    "qq_send_image": "向 QQ 会话发送一张或多张图片（本地文件路径或 http(s) URL，最多 9 张）。",
-    "qq_send_voice": "向 QQ 会话发送一条语音消息（本地音频文件路径，NapCat 负责转码）。",
-    "qq_send_video": "向 QQ 会话发送一条视频消息（本地视频文件绝对路径）。",
-    "qq_send_file": "向 QQ 会话发送一个文件（本地文件绝对路径）。",
-    "qq_send_forward": "向 QQ 会话发送一条合并转发（多条节点消息组成的聊天记录卡片）。",
-    "qq_napcat_api": "调用白名单内的 NapCat OneBot action（成员查询/文件/OCR/AI 等）。",
-    "qq_group_history": "拉取 QQ 群最近消息历史，用于群总结或监控。",
+    "qq_send_image": "Send one or more images to a QQ chat (local file paths or http(s) URLs, max 9). 发送图片到 QQ 会话。",
+    "qq_send_voice": "Send a voice message to a QQ chat (local audio file; NapCat transcodes). 发送语音到 QQ 会话。",
+    "qq_send_video": "Send a video message to a QQ chat (absolute path of a local video file). 发送视频到 QQ 会话。",
+    "qq_send_file": "Send a file to a QQ chat (absolute path of a local file). 发送文件到 QQ 会话。",
+    "qq_send_forward": "Send a merged forward to a QQ chat (chat-history card of named node messages). 发送合并转发。",
+    "qq_napcat_api": "Call a whitelisted NapCat OneBot action (member queries / file URLs / OCR / AI etc.). 调用白名单内的 NapCat action。",
+    "qq_group_history": "Pull recent QQ group message history for summarization or monitoring. 拉取 QQ 群最近消息历史。",
 }
 
 

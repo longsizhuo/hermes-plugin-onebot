@@ -69,7 +69,6 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    _AUDIO_EXTS,
 )
 from gateway.session import SessionSource
 
@@ -93,11 +92,26 @@ _MODEL_PICKER_NUMBER_RE = re.compile(r"^/model\s+(\d+)\s*$")
 # Image extensions for the standalone HTTP sender (base.py keeps its own
 # _IMAGE_EXTS as a function-local set, so we declare the plugin copy).
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"})
+
+# T11 review (non-blocking): stop importing upstream's private _AUDIO_EXTS —
+# plugins own their copies. Exact mirror of gateway/platforms/base.py's
+# _AUDIO_MIME_TYPES (kept in sync manually; used for voice vs file CQ choice).
+_AUDIO_MIME_TYPES = {
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".mp3": "audio/mpeg",
+    ".m2a": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/m4a",
+    ".flac": "audio/flac",
+}
+_AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
+
 IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.2.0"
 
 # Max bytes for a downloaded voice clip (silk/amr from QQ).
 AUDIO_MAX_BYTES = 15 * 1024 * 1024
@@ -133,6 +147,58 @@ def _is_loopback_peer(peer: Optional[str]) -> bool:
     if addr.version == 6 and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return addr.is_loopback
+
+
+def _plugin_data_dir() -> "Path":
+    """T11 review #8: per-plugin persistent state root.
+
+    ``$HERMES_HOME/plugin-data/onebot-platform/`` — lives where HERMES_HOME
+    lives (writable, profile-isolated, container-volume backed) instead of
+    ``/tmp/hermes_onebot`` (wiped by tmp cleaners, shared across users).
+    Media downloads go in its ``media/`` subdir; state files sit at the
+    root. Created lazily by writers.
+    """
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "plugin-data" / "onebot-platform"
+
+
+def _media_dir() -> "Path":
+    """Downloaded / generated media dir (``$HERMES_HOME/plugin-data/onebot-platform/media/``)."""
+    return _plugin_data_dir() / "media"
+
+
+def _ensure_media_dir() -> "Path":
+    d = _media_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _legacy_tmp_dir() -> "Path":
+    """Pre-1.2 media dir ``/tmp/hermes_onebot`` — swept by _cleanup_tmp_files, never written."""
+    return Path(tempfile.gettempdir()) / "hermes_onebot"
+
+
+def _migrate_legacy_state_file(legacy: "Path", new: "Path") -> None:
+    """T11 review #8: one-time migration of v1.1.x state files.
+
+    Copies ``legacy`` → ``new`` when ``new`` is absent; the legacy file is
+    left in place as a rollback backup (copy, not move). Never raises — a
+    failed migration degrades to starting with a fresh file, never to a
+    lost state file.
+    """
+    try:
+        if not legacy.is_file() or new.exists():
+            return
+        new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, new)
+        logger.info("[onebot] migrated legacy state file %s -> %s", legacy, new)
+    except Exception as e:
+        logger.warning(
+            "[onebot] state file migration from %s failed (starting fresh): %s",
+            legacy,
+            e,
+        )
 
 
 def _load_onebot_utils():
@@ -1142,11 +1208,17 @@ class OneBotAdapter(BasePlatformAdapter):
     # -- 昵称持久化（t2i 顶栏；重启后 cron 推送/会话恢复也能画出顶栏） --
 
     def _nicknames_file(self) -> str:
-        # Runtime state lives under HERMES_HOME, not the plugin package dir
-        # (read-only pip installs / profile isolation).
+        # T11 review #8: runtime state moved under
+        # $HERMES_HOME/plugin-data/onebot-platform/ (v1.2.0). One-time
+        # migration copies the v1.1.x location on first touch; the legacy
+        # file stays as a rollback backup.
         from hermes_constants import get_hermes_home
 
-        return str(get_hermes_home() / "onebot_nicknames.json")
+        legacy = Path(get_hermes_home()) / "onebot_nicknames.json"
+        new = _plugin_data_dir() / "onebot_nicknames.json"
+        _migrate_legacy_state_file(legacy, new)
+        new.parent.mkdir(parents=True, exist_ok=True)
+        return str(new)
 
     def _load_nicknames(self) -> None:
         try:
@@ -1154,7 +1226,8 @@ class OneBotAdapter(BasePlatformAdapter):
                 data = json.load(f)
             if isinstance(data, dict):
                 self._nicknames = {str(k): str(v) for k, v in data.items()}
-        except Exception:
+        except Exception as e:
+            logger.debug("[onebot] load nicknames failed: %s", e)
             self._nicknames = {}
 
     def _persist_nicknames(self) -> None:
@@ -1168,11 +1241,16 @@ class OneBotAdapter(BasePlatformAdapter):
             logger.debug("[onebot] persist nicknames failed: %s", e)
 
     def _requests_file(self) -> str:
-        # Runtime state lives under HERMES_HOME, not the plugin package dir
-        # (read-only pip installs / profile isolation).
+        # T11 review #8: same relocation + one-time migration as
+        # _nicknames_file (approval ledger carries QQ ids; the file itself
+        # stays 0600 via _persist_requests).
         from hermes_constants import get_hermes_home
 
-        return str(get_hermes_home() / "onebot_requests.json")
+        legacy = Path(get_hermes_home()) / "onebot_requests.json"
+        new = _plugin_data_dir() / "onebot_requests.json"
+        _migrate_legacy_state_file(legacy, new)
+        new.parent.mkdir(parents=True, exist_ok=True)
+        return str(new)
 
     def _load_requests(self) -> None:
         """恢复审批台账（flag -> record）；seq 计数器取历史最大值续增。
@@ -1445,7 +1523,7 @@ class OneBotAdapter(BasePlatformAdapter):
                 media_types=media_types,
             )
             await self.handle_message(event)
-            # 顺带清理过期临时媒体文件（防 /tmp/hermes_onebot 无限堆积）
+            # 顺带清理过期临时媒体文件（防 plugin-data media 目录无限堆积）
             self._cleanup_tmp_files()
         except Exception as e:
             logger.error("[onebot] failed processing message: %s", e, exc_info=True)
@@ -1796,8 +1874,7 @@ class OneBotAdapter(BasePlatformAdapter):
                 return None
             if len(data) > IMAGE_MAX_BYTES:
                 return None
-            tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-            tmp.mkdir(exist_ok=True)
+            tmp = _ensure_media_dir()
             path = tmp / f"img_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
             path.write_bytes(data)
             return str(path)
@@ -1818,23 +1895,26 @@ class OneBotAdapter(BasePlatformAdapter):
         return None
 
     def _cleanup_tmp_files(self, max_age: float = 6 * 3600) -> None:
-        """删除 /tmp/hermes_onebot/ 下超过 max_age 秒的临时媒体文件。
+        """删除 plugin-data media（及旧 /tmp/hermes_onebot）下超过 max_age 秒的临时媒体文件。
 
         入站图片/视频下载后只写不删，长期运行会堆积磁盘；每次入站
         媒体处理后顺带清理一次。语音 .wav/.bin 由调用方自行删除，
         这里同样兜底。
         """
         try:
-            tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-            if not tmp.is_dir():
-                return
+            # T11 review #8: sweep both the new plugin-data media dir and
+            # the legacy /tmp/hermes_onebot (pre-1.2 installs may still
+            # hold stale files there; it is never written again).
             now = time.time()
-            for p in tmp.iterdir():
-                try:
-                    if p.is_file() and (now - p.stat().st_mtime) > max_age:
-                        p.unlink(missing_ok=True)
-                except (OSError, FileNotFoundError):
-                    pass
+            for tmp in (_media_dir(), _legacy_tmp_dir()):
+                if not tmp.is_dir():
+                    continue
+                for p in tmp.iterdir():
+                    try:
+                        if p.is_file() and (now - p.stat().st_mtime) > max_age:
+                            p.unlink(missing_ok=True)
+                    except (OSError, FileNotFoundError):
+                        pass
         except Exception:
             pass
 
@@ -1854,8 +1934,7 @@ class OneBotAdapter(BasePlatformAdapter):
         ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "")) or ".jpg"
         if ext == ".jpe":
             ext = ".jpg"
-        tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-        tmp.mkdir(exist_ok=True)
+        tmp = _ensure_media_dir()
         path = tmp / f"img_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{ext}"
         path.write_bytes(data)
         # Shrink oversized images BEFORE the LLM sees them — high-res QQ
@@ -1892,8 +1971,7 @@ class OneBotAdapter(BasePlatformAdapter):
         ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "")) if resp else ""
         if not ext or ext == ".jpe":
             ext = ".mp4" if kind == "video" else ".bin"
-        tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-        tmp.mkdir(exist_ok=True)
+        tmp = _ensure_media_dir()
         path = tmp / f"{kind}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{ext}"
         path.write_bytes(data)
         return str(path)
@@ -1904,7 +1982,7 @@ class OneBotAdapter(BasePlatformAdapter):
         NapCat 容器内的 get_file 路径对宿主不可达，所以：
         1. 优先私聊 CDN 直链 get_private_file_url(file_id) → HTTP 下载；
         2. 回退 get_file 的 base64 / http(s) url 载荷（NapCat 文件服务开启时）。
-        成功返回 /tmp/hermes_onebot/ 下的本地路径，失败返回 None。
+        成功返回 $HERMES_HOME/plugin-data/onebot-platform/media/ 下的本地路径，失败返回 None。
         """
         fid = data.get("file_id") or data.get("file") or ""
         if not fid:
@@ -1958,7 +2036,7 @@ class OneBotAdapter(BasePlatformAdapter):
     async def _download_file_bytes(
         self, url: str, safe_name: str, max_bytes: int
     ) -> Optional[str]:
-        """下载入站文件到 /tmp/hermes_onebot/<safe_name>，带大小上限。"""
+        """下载入站文件到 plugin-data media/<safe_name>，带大小上限。"""
         try:
             if url.lower().startswith("base64://"):
                 try:
@@ -1978,8 +2056,7 @@ class OneBotAdapter(BasePlatformAdapter):
             if max_bytes > 0 and len(data) > max_bytes:
                 logger.warning("[onebot] inbound file too large (%d B), skipping", len(data))
                 return None
-            tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-            tmp.mkdir(exist_ok=True)
+            tmp = _ensure_media_dir()
             path = tmp / safe_name
             if path.exists():
                 stem = Path(safe_name).stem
@@ -2103,8 +2180,7 @@ class OneBotAdapter(BasePlatformAdapter):
             logger.debug("[onebot] voice too large, skipping (%d bytes)", len(data))
             return None
 
-        tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-        tmp.mkdir(exist_ok=True)
+        tmp = _ensure_media_dir()
         stem = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         in_path = tmp / f"voice_{stem}.bin"
         out_path = tmp / f"voice_{stem}.wav"
@@ -2362,8 +2438,7 @@ class OneBotAdapter(BasePlatformAdapter):
             if summary_text.strip():
                 png = await asyncio.to_thread(render_text_image, summary_text, "本轮进展")
                 if png:
-                    tmp = Path(tempfile.gettempdir()) / "hermes_onebot"
-                    tmp.mkdir(exist_ok=True)
+                    tmp = _ensure_media_dir()
                     card = tmp / f"loop_summary_{int(time.time() * 1000)}.png"
                     card.write_bytes(png)
                     res = await self.send_image_file(chat_id, str(card))

@@ -41,7 +41,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 hermes plugins install https://github.com/mario841859784/hermes-plugin-onebot.git
 ```
 
-走代理时按惯例加 `HTTPS_PROXY=...` 前缀。Python 依赖：Hermes 环境自带之外仅 **`fonttools>=4,<5`**，且只有长回复的文字转图（t2i）档位需要（渲染卡片所需的 CJK 系统字体见下方「字体依赖」）。主仓 hermes-agent `pyproject.toml` 的 pin 不随本仓携带——使用 t2i 档位时请把 `fonttools>=4,<5` 装进运行网关的 Python 环境。
+走代理时按惯例加 `HTTPS_PROXY=...` 前缀。Python 依赖已在 `plugin.yaml` 里声明（`python_dependencies: ["fonttools>=4,<5"]`），由插件加载器自动安装——仅长回复的文字转图（t2i）档位需要（渲染卡片所需的 CJK 系统字体见下方「字体依赖」）。无需手工 pip。
 
 维护者：**mario841859784**
 
@@ -219,7 +219,8 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 ### 好友申请/群邀请审批
 
 入站 OneBot `request` 事件（`request_type=friend`，或 `request_type=group` 且
-`sub_type=add` / `invite`）会被解析、记录到 `<HERMES_HOME>/onebot_requests.json`
+`sub_type=add` / `invite`）会被解析、记录到 `<HERMES_HOME>/plugin-data/onebot-platform/onebot_requests.json`
+（v1.2.0 起迁移至此；首次触碰时一次性从 v1.1.x 的 `<HERMES_HOME>/onebot_requests.json` 迁移，旧文件保留作备份）
 （0600——含申请者 QQ 号与验证消息，属敏感数据），并给每个配置的 admin 私聊推送
 通知（含序号、申请人、验证消息摘要与 flag）。admin 在私聊里回复 `/approve 1` /
 `/reject 1`（或用完整 flag）即可审批。审批幂等（已处理的 flag 不会二次调 API）、

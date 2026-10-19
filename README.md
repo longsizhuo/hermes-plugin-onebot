@@ -43,7 +43,7 @@ This plugin lives in its own repo — install it with the Hermes plugin manager 
 hermes plugins install https://github.com/mario841859784/hermes-plugin-onebot.git
 ```
 
-Prefix with `HTTPS_PROXY=...` when behind a proxy, as usual. Python dependencies: nothing beyond what the Hermes environment already ships, except **`fonttools>=4,<5`**, which is only needed for the text-to-image tier of long replies (CJK system fonts for the rendered cards: see *Font dependencies* below). The `fonttools` pin in the main hermes-agent `pyproject.toml` is not carried by this repo — install `fonttools>=4,<5` into the Python environment that runs your gateway if you use that tier.
+Prefix with `HTTPS_PROXY=...` when behind a proxy, as usual. Python dependencies are declared in `plugin.yaml` (`python_dependencies: ["fonttools>=4,<5"]`) and installed automatically by the plugin loader — only the text-to-image tier of long replies needs it (CJK system fonts for the rendered cards: see *Font dependencies* below). No manual pip steps.
 
 Maintained by **mario841859784**.
 
@@ -239,7 +239,8 @@ Admins get a few local slash commands handled inside the adapter (anything else 
 ### Friend request / group invite approval
 
 Incoming OneBot `request` events (`request_type=friend`, or `request_type=group` with
-`sub_type=add` / `invite`) are parsed, recorded to `<HERMES_HOME>/onebot_requests.json`
+`sub_type=add` / `invite`) are parsed, recorded to `<HERMES_HOME>/plugin-data/onebot-platform/onebot_requests.json`
+(v1.2.0; one-time migration from the v1.1.x `<HERMES_HOME>/onebot_requests.json` on first touch — the legacy file is kept as a backup)
 (0600 — contains applicant QQ ids and verification messages, treat as sensitive), and
 every configured admin gets a private DM with the sequence number, applicant, verification
 message summary and flag. Reply `/approve 1` / `/reject 1` (or use the full flag) in the
