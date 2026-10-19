@@ -72,15 +72,22 @@ def _session_chat() -> Optional[str]:
 def _access_token() -> str:
     """Resolve the access token shared with the adapter's ``/api`` gate.
 
-    Same source as the adapter — no new config key: ``ONEBOT_ACCESS_TOKEN``
-    env (the override the standalone cron sender already honours) wins, then
-    the onebot platform's ``access_token`` from the gateway config. Empty
-    when unset; ``_http`` sends no Authorization header in that case, which
-    keeps token-less loopback deployments byte-for-byte unchanged.
+    T11 review #5: primary source is ``agent.secret_scope.get_secret(
+    "ONEBOT_ACCESS_TOKEN")`` — honors the active profile scope (multiplexed
+    deployments) and reads ``os.environ`` when no scope is active, so plain
+    env deployments keep working. Fallback is the onebot platform's
+    ``access_token`` from the gateway config. Empty when unset; ``_http``
+    sends no Authorization header in that case, which keeps token-less
+    loopback deployments byte-for-byte unchanged.
     """
-    env = os.getenv("ONEBOT_ACCESS_TOKEN", "").strip()
-    if env:
-        return env
+    try:
+        from agent.secret_scope import get_secret
+
+        scoped = get_secret("ONEBOT_ACCESS_TOKEN")
+        if scoped:
+            return str(scoped).strip()
+    except Exception as e:  # noqa: BLE001 - tools must degrade to no-auth
+        logger.debug("[onebot-tools] secret_scope token lookup skipped: %s", e)
     try:
         # Lazy import: tools.py must stay importable in stripped-down
         # processes; same config load the adapter's standalone sender uses.

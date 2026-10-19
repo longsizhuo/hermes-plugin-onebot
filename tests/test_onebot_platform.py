@@ -25,6 +25,7 @@ from onebot_platform.adapter import (
     MAX_MESSAGE_LENGTH,
     OneBotAdapter,
     _is_loopback_peer,
+    _standalone_access_token,
     render_text_image,
 )
 from onebot_platform import t2i_render
@@ -2454,58 +2455,14 @@ def test_send_t2i_over_limit_falls_back_to_text_chunks(monkeypatch) -> None:
         assert all(seg["type"] == "text" for seg in payload["params"]["message"])
 
 
-def test_reverse_server_startup_warns_non_loopback_without_token(caplog) -> None:
-    """A4 启动期告警：绑定非 loopback host（含 localhost 等主机名，按事实
-    陈述措辞提示）且未配 access_token → 启动即 WARNING 一次；配 token 或
-    loopback host 不告警。"""
-    adapter = _make_adapter(host="0.0.0.0", port=0)
-
-    async def run():
-        await adapter._start_reverse_server()
-        try:
-            pass
-        finally:
-            await adapter._runner.cleanup()
-
-    with caplog.at_level(logging.WARNING, logger="onebot_platform.adapter"):
-        asyncio.run(run())
-
-    warn_texts = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any(
-        "not a loopback literal" in t and "access_token" in t for t in warn_texts
-    ), warn_texts
-
-    # 反例 1：默认 loopback host 不告警
-    caplog.clear()
-    adapter2 = _make_adapter(port=0)
-
-    async def run2():
-        await adapter2._start_reverse_server()
-        await adapter2._runner.cleanup()
-
-    with caplog.at_level(logging.WARNING, logger="onebot_platform.adapter"):
-        asyncio.run(run2())
-    assert not [
-        r.getMessage()
-        for r in caplog.records
-        if r.levelno == logging.WARNING and "not a loopback literal" in r.getMessage()
-    ]
-
-    # 反例 2：非 loopback host 但已配 token 不告警
-    caplog.clear()
-    adapter3 = _make_adapter(host="0.0.0.0", port=0, access_token="s3cret")
-
-    async def run3():
-        await adapter3._start_reverse_server()
-        await adapter3._runner.cleanup()
-
-    with caplog.at_level(logging.WARNING, logger="onebot_platform.adapter"):
-        asyncio.run(run3())
-    assert not [
-        r.getMessage()
-        for r in caplog.records
-        if r.levelno == logging.WARNING and "not a loopback literal" in r.getMessage()
-    ]
+def test_reverse_server_startup_raises_hostname_without_token() -> None:
+    """T11 review #4（替代原 A4 WARNING 断言）：非 loopback host + 空
+    access_token → 启动即 raise（不再只是告警）。无法解析为 IP 字面量的
+    主机名（如 ``localhost``）按 fail-loud 一并拒绝；loopback / 配 token
+    的放行样例见 ``test_bind_security_allows_loopback_and_token``。"""
+    adapter = _make_adapter(host="localhost", port=0)
+    with pytest.raises(ValueError, match="non-loopback"):
+        asyncio.run(adapter._start_reverse_server())
 
 
 # ---------------------------------------------------------------------------
@@ -3951,3 +3908,84 @@ def test_tools_forward_session_chat(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "onebot")
     tools.qq_send_video({"path": "/tmp/a.mp4", "chat_id": "group:999"})
     assert calls[2]["session_chat"] is None
+
+
+# ── T11 review #4/#5：绑定安全硬失败 + secret_scope 凭证读取 ────────────────
+
+def test_bind_security_raises_non_loopback_no_token() -> None:
+    """#4: 非 loopback host + 空 access_token → _start_reverse_server raise。"""
+    adapter = _make_adapter(host="0.0.0.0")
+    with pytest.raises(ValueError, match="non-loopback"):
+        asyncio.run(adapter._start_reverse_server())
+
+
+def test_bind_security_connect_returns_false() -> None:
+    """#4: raise 经 connect() 兜底 → 记 ERROR、返回 False（不再启动服务）。"""
+    adapter = _make_adapter(host="192.168.1.50")
+    assert asyncio.run(adapter.connect()) is False
+
+
+def test_bind_security_forward_mode_raises() -> None:
+    """#4: forward 模式同样拒绝 —— _start_api_server 先校验再绑定。"""
+    adapter = _make_adapter(mode="forward", host="192.168.1.50")
+    with pytest.raises(ValueError, match="non-loopback"):
+        asyncio.run(adapter._start_api_server())
+
+
+def test_bind_security_allows_loopback_and_token() -> None:
+    """#4 正向对照: loopback 无 token、非 loopback 有 token 均放行。"""
+    assert _make_adapter(host="127.0.0.1")._validate_bind_security() is None
+    assert _make_adapter(host="0.0.0.0", access_token="t")._validate_bind_security() is None
+    # IPv6 loopback 字面量同放行
+    assert _make_adapter(host="::1")._validate_bind_security() is None
+
+
+def test_standalone_token_prefers_secret_scope(monkeypatch) -> None:
+    """#5: standalone sender 先走 agent.secret_scope.get_secret。"""
+    import agent.secret_scope as ss
+
+    monkeypatch.setattr(ss, "get_secret", lambda name, default=None: "scoped-tok")
+    assert _standalone_access_token({"access_token": "cfg-tok"}) == "scoped-tok"
+
+    # UnscopedSecretError / 任何异常 → 回落 extra.access_token
+    def raise_unscoped(name, default=None):
+        raise ss.UnscopedSecretError(name, "no scope")
+
+    monkeypatch.setattr(ss, "get_secret", raise_unscoped)
+    assert _standalone_access_token({"access_token": "cfg-tok"}) == "cfg-tok"
+
+    # 无 scope 命中（单 profile: get_secret 直读 env）→ env 值生效
+    monkeypatch.setattr(ss, "get_secret", lambda name, default=None: os.environ.get(name, default))
+    monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "env-tok")
+    assert _standalone_access_token({}) == "env-tok"
+
+
+def test_standalone_token_falls_back_to_extra(monkeypatch) -> None:
+    """#5: get_secret 返回 None 且 env 未设 → extra.access_token 兜底。"""
+    import agent.secret_scope as ss
+
+    monkeypatch.setattr(ss, "get_secret", lambda name, default=None: default)
+    monkeypatch.delenv("ONEBOT_ACCESS_TOKEN", raising=False)
+    assert _standalone_access_token({"access_token": "cfg-tok"}) == "cfg-tok"
+    assert _standalone_access_token({}) == ""
+
+
+def test_tools_token_via_secret_scope(monkeypatch) -> None:
+    """#5: tools._access_token 同源改造 —— 先 get_secret，再 config。"""
+    from onebot_platform import tools
+    import agent.secret_scope as ss
+
+    monkeypatch.setattr(ss, "get_secret", lambda name, default=None: "scoped-tok")
+    assert tools._access_token() == "scoped-tok"
+
+    monkeypatch.setattr(ss, "get_secret", lambda name, default=None: os.environ.get(name, default))
+    monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "env-tok")
+    assert tools._access_token() == "env-tok"
+
+    monkeypatch.delenv("ONEBOT_ACCESS_TOKEN", raising=False)
+    # get_secret 失效（如导入失败语义）→ 回落 gateway config
+    def boom(name, default=None):
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(ss, "get_secret", boom)
+    assert tools._access_token() in ("", None) or isinstance(tools._access_token(), str)

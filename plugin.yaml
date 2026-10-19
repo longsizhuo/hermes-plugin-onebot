@@ -33,3 +33,7 @@ optional_env:
     description: "Default chat id for cron / notification delivery (e.g. private:123456789)"
     prompt: "Home channel (private:<qq> or group:<qq>)"
     password: false
+  - name: ONEBOT_ACCESS_TOKEN
+    description: "Bridge access token override; must match NapCat's token (required when the adapter binds a non-loopback host)"
+    prompt: "Access token (empty only for same-host loopback deployments)"
+    password: true

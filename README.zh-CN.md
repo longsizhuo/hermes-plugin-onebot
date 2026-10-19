@@ -136,9 +136,11 @@ forward 模式单独成 server——共用同一道鉴权闸门：
   `127.0.0.0/8` 全段与 IPv4-mapped loopback 形式）；其他来源一律 401 并逐条
   记录 WARNING。默认 `127.0.0.1` 部署不受影响。
 
-**`host` 配 `0.0.0.0`（或任何非 loopback 地址）时必须设置 `access_token`**：
-不配 token 时，能连上端口的任意主机都能以“桥”的身份接入 `/ws`，而本地辅助端点
-又只对 loopback 放行——等于绑定 `0.0.0.0` 却让桥协议处于无鉴权状态。
+**`host` 配 `0.0.0.0`（或任何非 loopback 地址）时必须设置 `access_token`——
+v1.2.0 起未配 token 直接拒绝启动**（此前仅告警）：不配 token 时，能连上端口的
+任意主机都能以“桥”的身份接入 `/ws`，而本地辅助端点又只对 loopback 放行——等于
+绑定 `0.0.0.0` 却让桥协议处于无鉴权状态。因此 **Hermes 与 NapCat 不在同一台
+机器（LAN 部署）必须设置 `access_token`**。
 
 内置 qq_* 模型工具会自动携带凭证：设置 `access_token` 后，它们的 `/api/*` 请求
 自动附上 `Authorization: Bearer <token>`——凭证与 adapter 同源（gateway 配置中的
@@ -155,7 +157,7 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 - **reverse 模式（推荐，NapCat 拨入）**：在 NapCat 网络设置里添加 **WebSocket 客户端**：
   - 上报地址：`ws://<hermes-host-ip>:<port>/ws`（如 `ws://192.168.1.100:8643/ws`；Hermes 和 NapCat 不在同一台机器时用局域网 IP，别用 `127.0.0.1`）
-  - token：与 Hermes 侧 `access_token` 一致（都没有就不填）
+  - token：与 Hermes 侧 `access_token` 一致——**Hermes 与 NapCat 不在同一台机器时必填**（未配 token 时适配器拒绝绑定非 loopback 地址）；仅同机 loopback 部署可两边都留空
   - 消息上报格式：推荐 **array**（段数组优先解析，CQ 字符串仅作回退）
 - **forward 模式（Hermes 拨出）**：在 NapCat 网络设置里启用 **WebSocket 服务端**（默认 `0.0.0.0:3001`），然后把插件的 `url` 设成 `ws://<napcat-host-ip>:3001`（同机用 `ws://127.0.0.1:3001`），token 保持一致。
 

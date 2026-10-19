@@ -144,11 +144,13 @@ forward mode — and all of them sit behind one shared auth gate:
   served; requests from other addresses get `401` and a WARNING is logged per
   request. Default `127.0.0.1` deployments are unaffected.
 
-**If `host` is set to `0.0.0.0` (or any other non-loopback address), you MUST
-set `access_token`.** Without a token, any host that can reach the port can
-connect to `/ws` as if it were your bridge, while the local helper endpoints
-stay locked to loopback — leaving a `0.0.0.0` deployment unauthenticated for
-the very protocol it was bound for.
+**If `host` is set to `0.0.0.0` (or any other non-loopback address), `access_token`
+is REQUIRED — the adapter now refuses to start without it** (v1.2.0; previously
+a warning only). Without a token, any host that can reach the port can connect
+to `/ws` as if it were your bridge, while the local helper endpoints stay
+locked to loopback — leaving a `0.0.0.0` deployment unauthenticated for the
+very protocol it was bound for. LAN deployments (Hermes and NapCat on
+different machines) must therefore always set `access_token`.
 
 The bundled qq_* model tools authenticate automatically: once `access_token`
 is set, their `/api/*` requests carry `Authorization: Bearer <token>` — the
@@ -168,7 +170,7 @@ After enabling the plugin you **must also configure the bridge**. The plugin can
 
 - **reverse mode (recommended, NapCat dials in)**: in NapCat's network settings add a **WebSocket client**:
   - report URL: `ws://<hermes-host-ip>:<port>/ws` (e.g. `ws://192.168.1.100:8643/ws`; use the LAN IP, not `127.0.0.1`, when Hermes and NapCat are on different machines)
-  - token: same value as `access_token` on the Hermes side (leave both empty if no token)
+  - token: same value as `access_token` on the Hermes side — **required whenever Hermes and NapCat are on different machines** (the adapter refuses to bind a non-loopback address without a token); only same-host loopback deployments may leave both empty
   - message post format: **array** is recommended (segment-array parsing first, CQ string only as fallback)
 - **forward mode (Hermes dials out)**: in NapCat's network settings enable the **WebSocket server** (default `0.0.0.0:3001`), then set the plugin's `url` to `ws://<napcat-host-ip>:3001` (`ws://127.0.0.1:3001` when same host) and keep tokens identical.
 

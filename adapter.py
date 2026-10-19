@@ -465,17 +465,31 @@ class OneBotAdapter(BasePlatformAdapter):
         app.router.add_get("/api/napcat", self._handle_napcat_api)
         app.router.add_post("/api/send_media", self._handle_send_media)
 
+    def _validate_bind_security(self) -> None:
+        """T11 review #4: refuse to bind a non-loopback host without a token.
+
+        Reverse-WS and forward-mode API servers both expose an endpoint that
+        can forge an admin ``user_id``; on a LAN without ``access_token``
+        anyone who can reach the port IS the bot. A warning is not enough —
+        raise so ``connect()`` fails loudly (logged as ``connect failed``).
+        Hostnames that don't parse as IP literals are treated as
+        non-loopback (fail-loud, same rule as ``_is_loopback_peer``).
+        """
+        if self._access_token or _is_loopback_peer(self._host):
+            return
+        raise ValueError(
+            f"onebot: refusing to bind non-loopback host {self._host!r} without "
+            f"access_token — any LAN peer could connect as the bot. Set "
+            f"access_token in the platform config (and the same token in "
+            f"NapCat) or keep host on 127.0.0.1"
+        )
+
     async def _start_reverse_server(self) -> None:
-        # A4 启动期告警：非 loopback host + 未配 access_token 的裸奔部署，
-        # 启动即提示一次（运行期 _check_api_auth 仍有逐请求 WARNING 兜底）。
-        # 复用 _is_loopback_peer 判定；主机名等无法解析的取值按非 loopback
-        # 处理（fail-loud，宁多告警不漏裸奔）。
-        if not self._access_token and not _is_loopback_peer(self._host):
-            logger.warning(
-                "[onebot] reverse server host %s is not a loopback literal — "
-                "if it resolves publicly, set access_token",
-                self._host,
-            )
+        # T11 review #4: 非 loopback host + 空 access_token → 拒绝启动
+        # （原为 WARNING；LAN 内任何人可连上桥伪造 admin user_id，必须 raise，
+        # 由 connect() 记 ERROR 并返回 False）。运行期 _check_api_auth 仍有
+        # 逐请求判定兜底。
+        self._validate_bind_security()
         app = web.Application()
         app.router.add_get("/ws", self._handle_reverse_ws)
         app.router.add_get("/onebot", self._handle_reverse_ws)
@@ -805,7 +819,12 @@ class OneBotAdapter(BasePlatformAdapter):
         base URL 一致）；鉴权复用 `_check_api_auth`，语义与 reverse 完全
         一致。与 reverse 分支互斥：单个 adapter 实例按 `mode` 只走其中一条
         connect 路径，两个 server 不会同时存在。
+
+        T11 review #4: 同 reverse —— 非 loopback host 且未配 access_token
+        时拒绝启动（raise），否则 LAN 内任何人可调用 /api/send_media 等桥
+        接口。
         """
+        self._validate_bind_security()
         app = web.Application()
         self._register_api_routes(app)
         runner = web.AppRunner(app)
@@ -2855,7 +2874,7 @@ async def _standalone_send(
     """
     extra = getattr(pconfig, "extra", {}) or {}
     http_url = os.getenv("ONEBOT_HTTP_URL") or extra.get("http_url", "")
-    token = os.getenv("ONEBOT_ACCESS_TOKEN") or extra.get("access_token", "")
+    token = _standalone_access_token(extra)
     voice_mount = extra.get("voice_mount") or {}
     # Fallback: pconfig.extra may be stale (cached platform config); re-read
     # voice_mount from config.yaml so host→container mapping stays live.
@@ -2952,6 +2971,25 @@ async def _standalone_send(
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
+
+
+def _standalone_access_token(extra: Dict[str, Any]) -> str:
+    """T11 review #5: resolve the bridge token via ``agent.secret_scope`` first.
+
+    ``get_secret("ONEBOT_ACCESS_TOKEN")`` honors the active profile scope
+    (multiplexed deployments) and reads ``os.environ`` when no scope is
+    active; ``UnscopedSecretError`` (multiplex on, no scope) and import
+    failures degrade to the ``access_token`` key in gateway-config extra.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        scoped = get_secret("ONEBOT_ACCESS_TOKEN")
+        if scoped:
+            return str(scoped).strip()
+    except Exception as e:
+        logger.debug("[onebot] secret_scope token lookup skipped: %s", e)
+    return str(extra.get("access_token", "") or "").strip()
 
 
 def check_requirements() -> bool:
