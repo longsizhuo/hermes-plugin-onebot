@@ -565,6 +565,31 @@ class OneBotAdapter(BasePlatformAdapter):
             params = json.loads(request.query.get("params") or "{}")
         except json.JSONDecodeError:
             params = {}
+        # T11 review #3: upload_group_file / upload_private_file carry a
+        # LOCAL file path in params.file. Keep the action whitelisted but
+        # gate the read through the same media-delivery validator as the
+        # send_media pipeline (review #1) — denylist hits are rejected with
+        # 403 and never reach the bridge.
+        if action in ("upload_group_file", "upload_private_file") and isinstance(params, dict):
+            raw = str(params.get("file") or "")
+            safe = self.validate_media_delivery_path(raw)
+            if not safe:
+                logger.warning(
+                    "[onebot] napcat %s file blocked by media-delivery validator: %s",
+                    action,
+                    raw,
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": (
+                            "file rejected: local path is not permitted by the "
+                            "media-delivery validator (denylist or missing)"
+                        ),
+                    },
+                    status=403,
+                )
+            params["file"] = safe
         try:
             data = await self._call_action(action, params, timeout=30.0)
         except Exception as exc:
@@ -603,6 +628,31 @@ class OneBotAdapter(BasePlatformAdapter):
                 sources = [s for s in (payload.get("sources") or []) if isinstance(s, str) and s]
                 if not sources:
                     return web.json_response({"status": "error", "error": "sources empty"}, status=400)
+                # T11 review #1: gate every local source through the shared
+                # media-delivery validator BEFORE wrapping into file:// (the
+                # per-file gate in send_multiple_images stays as defense in
+                # depth for its direct callers). Fail closed with a named
+                # error instead of silently dropping a source.
+                for s in sources:
+                    if s.startswith(("http://", "https://")):
+                        continue
+                    safe = self.validate_media_delivery_path(s)
+                    if not safe:
+                        logger.warning(
+                            "[onebot] /api/send_media image source blocked by "
+                            "media-delivery validator: %s",
+                            s,
+                        )
+                        return web.json_response(
+                            {
+                                "status": "error",
+                                "error": (
+                                    f"image source rejected by media-delivery "
+                                    f"validator (denylist or missing): {s}"
+                                ),
+                            },
+                            status=403,
+                        )
                 images = [
                     (s if s.startswith(("http://", "https://")) else f"file://{s}", "")
                     for s in sources
@@ -2127,7 +2177,10 @@ class OneBotAdapter(BasePlatformAdapter):
                     # (extract_media contract) — unpack defensively so a tuple
                     # never reaches Path() as a TypeError and silently drops.
                     media_path = f[0] if isinstance(f, (tuple, list)) else f
-                    b64 = await self._file_to_base64(media_path)
+                    # T11 review #1: metadata.media_files are outbound
+                    # attachments read from local disk — same validator gate
+                    # as every other outbound read.
+                    b64 = await self._file_to_base64(media_path, gate=True)
                     if b64:
                         media_segments.append(
                             {"type": "image", "data": {"file": f"base64://{b64}"}}
@@ -2340,7 +2393,27 @@ class OneBotAdapter(BasePlatformAdapter):
                 logger.debug("[onebot] delete_msg failed for %s: %s", mid, e)
             await asyncio.sleep(0.06)  # 60ms 撤回间隔，防 NapCat 限速
 
-    async def _file_to_base64(self, path: str, max_bytes: int = IMAGE_MAX_BYTES) -> Optional[str]:
+    async def _file_to_base64(
+        self, path: str, max_bytes: int = IMAGE_MAX_BYTES, *, gate: bool = False
+    ) -> Optional[str]:
+        """Read a local file and base64-encode it for an outbound segment.
+
+        ``gate=True`` (T11 review #1): every OUTBOUND local-file read must
+        pass the shared media-delivery validator first — credential/system
+        paths (``~/.ssh``, ``$HERMES_HOME/.env``, ``/etc``, ...) are rejected
+        before a single byte is read. Inbound reads (downloaded media the
+        bridge itself produced) stay ungated — pass nothing.
+        """
+        if gate:
+            safe = self.validate_media_delivery_path(str(path or ""))
+            if not safe:
+                logger.warning(
+                    "[onebot] outbound media read blocked by media-delivery "
+                    "validator: %s",
+                    path,
+                )
+                return None
+            path = safe
         try:
             p = Path(path)
             if not p.exists() or p.stat().st_size > max_bytes:
@@ -2607,9 +2680,13 @@ class OneBotAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        b64 = await self._file_to_base64(str(image_path))
+        b64 = await self._file_to_base64(str(image_path), gate=True)
         if not b64:
-            return SendResult(success=False, error="image too large or unreadable", retryable=False)
+            return SendResult(
+                success=False,
+                error="image file rejected (media-delivery validator denylist), too large, or unreadable",
+                retryable=False,
+            )
         return await self._send_media(
             chat_id,
             [{"type": "image", "data": {"file": f"base64://{b64}"}}],
@@ -2633,7 +2710,9 @@ class OneBotAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
             if uri.startswith("file://"):
                 path = unquote(uri[7:])
-                b64 = await self._file_to_base64(path)
+                # T11 review #1: file:// sources are local reads for outbound
+                # delivery — same validator gate as the single-file senders.
+                b64 = await self._file_to_base64(path, gate=True)
                 if b64:
                     segs.append({"type": "image", "data": {"file": f"base64://{b64}"}})
             elif uri.startswith(("http://", "https://")):
@@ -2652,9 +2731,13 @@ class OneBotAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        b64 = await self._file_to_base64(str(audio_path), max_bytes=MEDIA_MAX_BYTES)
+        b64 = await self._file_to_base64(str(audio_path), max_bytes=MEDIA_MAX_BYTES, gate=True)
         if not b64:
-            return SendResult(success=False, error="voice too large or unreadable", retryable=False)
+            return SendResult(
+                success=False,
+                error="voice file rejected (media-delivery validator denylist), too large, or unreadable",
+                retryable=False,
+            )
         return await self._send_media(
             chat_id,
             [{"type": "record", "data": {"file": f"base64://{b64}"}}],
@@ -2671,9 +2754,13 @@ class OneBotAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        b64 = await self._file_to_base64(str(video_path), max_bytes=MEDIA_MAX_BYTES)
+        b64 = await self._file_to_base64(str(video_path), max_bytes=MEDIA_MAX_BYTES, gate=True)
         if not b64:
-            return SendResult(success=False, error="video too large or unreadable", retryable=False)
+            return SendResult(
+                success=False,
+                error="video file rejected (media-delivery validator denylist), too large, or unreadable",
+                retryable=False,
+            )
         return await self._send_media(
             chat_id,
             [{"type": "video", "data": {"file": f"base64://{b64}"}}],
@@ -2691,9 +2778,13 @@ class OneBotAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        b64 = await self._file_to_base64(str(file_path), max_bytes=MEDIA_MAX_BYTES)
+        b64 = await self._file_to_base64(str(file_path), max_bytes=MEDIA_MAX_BYTES, gate=True)
         if not b64:
-            return SendResult(success=False, error="file too large or unreadable", retryable=False)
+            return SendResult(
+                success=False,
+                error="file rejected (media-delivery validator denylist), too large, or unreadable",
+                retryable=False,
+            )
         name = file_name or Path(str(file_path)).name
         return await self._send_media(
             chat_id,

@@ -49,6 +49,34 @@ if _TEST_NS not in sys.modules:
 import pytest
 
 
+# Since the plugin moved to its standalone repo (T9), the bundled stub dir
+# hermes-agent/plugins/platforms/onebot/ is gone, so gateway.config.Platform's
+# bundled-directory scan can no longer resolve "onebot". Production resolves
+# it through the runtime platform registry — the plugin loader registers the
+# platform before any Platform("onebot") lookup (see
+# hermes_cli/plugins_loader.py and Platform._missing_ fallback). Mirror that
+# exact production sequence here: register a PlatformEntry whose
+# adapter_factory is the real adapter before the test modules import.
+try:
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    if not platform_registry.is_registered("onebot"):
+        from onebot_platform.adapter import OneBotAdapter
+
+        platform_registry.register(
+            PlatformEntry(
+                name="onebot",
+                label="QQ (OneBot)",
+                adapter_factory=OneBotAdapter,
+                check_fn=lambda: True,
+                source="plugin",
+                plugin_name="onebot-platform",
+            )
+        )
+except Exception as _reg_exc:  # pragma: no cover - bootstrap diagnostics only
+    print(f"[conftest] onebot platform registry bootstrap skipped: {_reg_exc}")
+
+
 @pytest.fixture(autouse=True)
 def _sandbox_hermes_home(tmp_path, monkeypatch):
     """Keep tests off the real Hermes home (mirrors upstream tests/conftest.py)."""

@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -3500,3 +3501,249 @@ def test_member_model_number_gets_no_reply_and_no_forward() -> None:
 
     assert events == []
     assert sent == []
+
+
+# ── T11 review #1/#3：本地媒体读取一律过 media-delivery validator ──────────
+
+def _write_secret_file(path: Path, content: str = "SECRET_TOKEN=x") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _capture_send_media(adapter):
+    """替换 adapter._send_media，捕获 (chat_id, segments) 并返回成功。"""
+    segs = []
+
+    async def fake_send_media(chat_id, segments, reply_to=None, caption=None):
+        segs.append((chat_id, segments))
+        return SendResult(success=True)
+
+    adapter._send_media = fake_send_media  # type: ignore[method-assign]
+    return segs
+
+
+def test_send_image_file_rejects_hermes_env() -> None:
+    """#1: $HERMES_HOME/.env 是凭据文件 → send_image_file 拒发、不读字节。"""
+    env_path = _write_secret_file(Path(os.environ["HERMES_HOME"]) / ".env")
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    res = asyncio.run(adapter.send_image_file("private:123", str(env_path)))
+
+    assert res.success is False
+    assert "media-delivery validator" in (res.error or "")
+    assert segs == []
+
+
+def test_send_voice_rejects_ssh_key() -> None:
+    """#1: ~/.ssh/id_rsa → send_voice 拒发。"""
+    key = _write_secret_file(Path(os.path.expanduser("~")) / ".ssh" / "id_rsa")
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    res = asyncio.run(adapter.send_voice("private:123", str(key)))
+
+    assert res.success is False
+    assert "media-delivery validator" in (res.error or "")
+    assert segs == []
+
+
+def test_send_document_rejects_etc_passwd() -> None:
+    """#1: /etc/passwd 在拒收前缀下 → send_document 拒发。"""
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    res = asyncio.run(adapter.send_document("private:123", "/etc/passwd"))
+
+    assert res.success is False
+    assert "media-delivery validator" in (res.error or "")
+    assert segs == []
+
+
+def test_send_video_rejects_missing_file() -> None:
+    """#1: validator 要求存在的常规文件 → 不存在的路径同样拒发。"""
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    res = asyncio.run(adapter.send_video("private:123", "/nonexistent/t11/x.mp4"))
+
+    assert res.success is False
+    assert "media-delivery validator" in (res.error or "")
+    assert segs == []
+
+
+def test_send_image_file_allows_normal_file() -> None:
+    """#1 正向对照: 普通路径过 validator → base64 进 segments。"""
+    ok = Path(os.environ["HERMES_HOME"]) / "media" / "ok.png"
+    ok.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"\x89PNG-fake-t11"
+    ok.write_bytes(payload)
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    res = asyncio.run(adapter.send_image_file("private:123", str(ok)))
+
+    assert res.success is True
+    assert len(segs) == 1
+    seg = segs[0][1][0]
+    assert seg["type"] == "image"
+    b64 = seg["data"]["file"].split("base64://", 1)[1]
+    assert base64.b64decode(b64) == payload
+
+
+def test_send_multiple_images_skips_denied_keeps_allowed() -> None:
+    """#1: send_multiple_images 逐文件过闸 — 拒收源静默跳过，正常源照发。"""
+    denied = _write_secret_file(Path(os.environ["HERMES_HOME"]) / ".env")
+    allowed = Path(os.environ["HERMES_HOME"]) / "media" / "ok.png"
+    allowed.parent.mkdir(parents=True, exist_ok=True)
+    allowed.write_bytes(b"\x89PNG-ok")
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    asyncio.run(
+        adapter.send_multiple_images(
+            "private:123",
+            [
+                (f"file://{denied}", ""),
+                (f"file://{allowed}", ""),
+                ("https://example.com/x.png", ""),
+            ],
+        )
+    )
+
+    assert len(segs) == 1
+    batch = segs[0][1]
+    assert [s["type"] for s in batch] == ["image", "image"]
+    # 拒收项无 segment：第一段是放行文件的 base64，第二段是 url 直发
+    b64 = batch[0]["data"]["file"].split("base64://", 1)[1]
+    assert base64.b64decode(b64) == b"\x89PNG-ok"
+    assert batch[1]["data"]["url"] == "https://example.com/x.png"
+
+
+def test_api_send_media_image_denied_source_403() -> None:
+    """#1: /api/send_media 本地源过闸 — 命中拒收清单 → 403 整单拒绝。"""
+    from aiohttp import ClientSession
+
+    env_path = _write_secret_file(Path(os.environ["HERMES_HOME"]) / ".env")
+    adapter = _make_adapter()
+    adapter._send_media = lambda *a, **kw: (  # 不应被触达
+        asyncio.sleep(0, result=SendResult(success=True))
+    )
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={"chat_id": "private:123", "kind": "image",
+                          "sources": [str(env_path)]},
+                ) as resp:
+                    assert resp.status == 403
+                    body = await resp.json()
+                    assert "media-delivery validator" in body["error"]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_api_send_media_voice_denied_source_error_payload() -> None:
+    """#1: /api/send_media kind=voice 命中拒收清单 → 错误载荷（不触桥）。"""
+    from aiohttp import ClientSession
+
+    key = _write_secret_file(Path(os.path.expanduser("~")) / ".ssh" / "id_rsa")
+    adapter = _make_adapter()
+    segs = _capture_send_media(adapter)
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={"chat_id": "private:123", "kind": "voice",
+                          "path": str(key)},
+                ) as resp:
+                    assert resp.status == 200
+                    body = await resp.json()
+                    assert body["status"] == "error"
+                    assert "media-delivery validator" in body["error"]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert segs == []
+
+
+def test_api_napcat_upload_file_denied_403() -> None:
+    """#3: upload_group_file 的 params.file 过闸 — 拒收路径 → 403。"""
+    from aiohttp import ClientSession
+    from urllib.parse import quote
+
+    env_path = _write_secret_file(Path(os.environ["HERMES_HOME"]) / ".env")
+    adapter = _make_adapter()
+    called = []
+
+    async def fake_call(action, params, timeout=30.0):
+        called.append((action, params))
+        return {}
+
+    adapter._call_action = fake_call  # type: ignore[method-assign]
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                params = json.dumps({"group_id": 888, "file": str(env_path)})
+                async with sess.get(
+                    f"http://127.0.0.1:{port}/api/napcat"
+                    f"?action=upload_group_file&params={quote(params)}"
+                ) as resp:
+                    assert resp.status == 403
+                    body = await resp.json()
+                    assert "media-delivery validator" in body["error"]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert called == []
+
+
+def test_api_napcat_upload_file_allowed_passes_resolved_path() -> None:
+    """#3 正向对照: 合规文件 → 透传，且 params.file 为 validator 解析后的路径。"""
+    from aiohttp import ClientSession
+    from urllib.parse import quote
+
+    ok = Path(os.environ["HERMES_HOME"]) / "media" / "doc.txt"
+    ok.parent.mkdir(parents=True, exist_ok=True)
+    ok.write_text("hello", encoding="utf-8")
+    adapter = _make_adapter()
+    called = []
+
+    async def fake_call(action, params, timeout=30.0):
+        called.append((action, dict(params)))
+        return {"file_id": "f1"}
+
+    adapter._call_action = fake_call  # type: ignore[method-assign]
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                params = json.dumps({"group_id": 888, "file": str(ok)})
+                async with sess.get(
+                    f"http://127.0.0.1:{port}/api/napcat"
+                    f"?action=upload_group_file&params={quote(params)}"
+                ) as resp:
+                    assert resp.status == 200
+                    body = await resp.json()
+                    assert body["status"] == "ok"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert called and called[0][0] == "upload_group_file"
+    assert Path(called[0][1]["file"]).is_file()
+    assert Path(called[0][1]["file"]).resolve() == ok.resolve()
