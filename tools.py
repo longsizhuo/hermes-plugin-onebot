@@ -56,6 +56,19 @@ def _resolve_chat(chat_id: Optional[str]) -> str:
     )
 
 
+def _session_chat() -> Optional[str]:
+    """Forward the calling onebot session's chat id (or None outside one).
+
+    T11 review #2: the tool layer cannot see session roles, so instead of
+    deciding here it forwards the session context and lets the adapter
+    enforce cross-chat authorization (``_authorize_cross_chat_send``).
+    """
+    platform = os.environ.get("HERMES_SESSION_PLATFORM", "") or ""
+    if platform.strip().lower() != "onebot":
+        return None
+    return (os.environ.get("HERMES_SESSION_CHAT_ID", "") or "").strip() or None
+
+
 def _access_token() -> str:
     """Resolve the access token shared with the adapter's ``/api`` gate.
 
@@ -133,7 +146,7 @@ def qq_send_image(args: Dict[str, Any], **kw) -> str:
     resp = _http(
         "POST",
         "/api/send_media",
-        {"chat_id": chat_id, "kind": "image", "sources": sources, "caption": args.get("caption") or ""},
+        {"chat_id": chat_id, "kind": "image", "sources": sources, "caption": args.get("caption") or "", "session_chat": _session_chat()},
     )
     return _media_result(resp)
 
@@ -143,7 +156,7 @@ def qq_send_voice(args: Dict[str, Any], **kw) -> str:
     if not path:
         return "qq_send_voice: path 必填"
     chat_id = _resolve_chat(args.get("chat_id"))
-    resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "voice", "path": path})
+    resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "voice", "path": path, "session_chat": _session_chat()})
     return _media_result(resp)
 
 
@@ -152,7 +165,7 @@ def qq_send_video(args: Dict[str, Any], **kw) -> str:
     if not path:
         return "qq_send_video: path 必填"
     chat_id = _resolve_chat(args.get("chat_id"))
-    resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "video", "path": path})
+    resp = _http("POST", "/api/send_media", {"chat_id": chat_id, "kind": "video", "path": path, "session_chat": _session_chat()})
     return _media_result(resp)
 
 
@@ -169,6 +182,7 @@ def qq_send_file(args: Dict[str, Any], **kw) -> str:
             "kind": "file",
             "path": path,
             "file_name": args.get("file_name") or "",
+            "session_chat": _session_chat(),
         },
     )
     return _media_result(resp)
@@ -191,7 +205,7 @@ def qq_send_forward(args: Dict[str, Any], **kw) -> str:
     resp = _http(
         "POST",
         "/api/send_media",
-        {"chat_id": chat_id, "kind": "forward", "nodes": cleaned},
+        {"chat_id": chat_id, "kind": "forward", "nodes": cleaned, "session_chat": _session_chat()},
     )
     return _media_result(resp)
 

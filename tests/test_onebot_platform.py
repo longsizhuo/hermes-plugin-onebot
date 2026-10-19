@@ -3747,3 +3747,207 @@ def test_api_napcat_upload_file_allowed_passes_resolved_path() -> None:
     assert called and called[0][0] == "upload_group_file"
     assert Path(called[0][1]["file"]).is_file()
     assert Path(called[0][1]["file"]).resolve() == ok.resolve()
+
+
+# ── T11 review #2：chat_id 越权（session 上下文转发 + admin 判定下沉 adapter）──
+
+def _media_adapter(extra=None):
+    """带 _send_media 捕获的 adapter，返回 (adapter, segs)。"""
+    adapter = _make_adapter(**(extra or {}))
+    segs = _capture_send_media(adapter)
+    return adapter, segs
+
+
+def test_api_send_media_cross_chat_denied_non_admin(monkeypatch) -> None:
+    """#2: QQ 会话内显式指到其他会话、且会话用户非 admin → 403。"""
+    from aiohttp import ClientSession
+
+    adapter, segs = _media_adapter({"admin_users": [111]})
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "group:999",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                        "session_chat": "private:222",
+                    },
+                ) as resp:
+                    assert resp.status == 403
+                    body = await resp.json()
+                    assert "cross-chat" in body["error"]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert segs == []
+
+
+def test_api_send_media_own_session_allowed() -> None:
+    """#2: 显式 chat_id == 当前会话 → 放行（无需 admin）。"""
+    from aiohttp import ClientSession
+
+    adapter, segs = _media_adapter()
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "private:222",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                        "session_chat": "private:222",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    body = await resp.json()
+                    assert body["status"] == "ok"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert len(segs) == 1
+
+
+def test_api_send_media_home_channel_target_allowed(monkeypatch) -> None:
+    """#2: 目标 == ONEBOT_HOME_CHANNEL → 放行。"""
+    from aiohttp import ClientSession
+
+    monkeypatch.setenv("ONEBOT_HOME_CHANNEL", "private:888")
+    adapter, segs = _media_adapter()
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "private:888",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                        "session_chat": "private:222",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert len(segs) == 1
+
+
+def test_api_send_media_admin_session_allowed() -> None:
+    """#2: 会话是 admin 的私聊（private:<admin qq>）→ 任意目标放行。"""
+    from aiohttp import ClientSession
+
+    adapter, segs = _media_adapter({"admin_users": [111]})
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "group:999",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                        "session_chat": "private:111",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    assert (await resp.json())["status"] == "ok"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert len(segs) == 1
+
+
+def test_api_send_media_group_session_denied_fail_closed() -> None:
+    """#2: 群会话无法归属到用户 → 一律 fail-closed（即使目标是 admin 私聊）。"""
+    from aiohttp import ClientSession
+
+    adapter, segs = _media_adapter({"admin_users": [111]})
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "private:111",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                        "session_chat": "group:777",
+                    },
+                ) as resp:
+                    assert resp.status == 403
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert segs == []
+
+
+def test_api_send_media_without_session_context_allowed() -> None:
+    """#2: 无 session 上下文（CLI/cron/脚本）→ 维持原行为放行。"""
+    from aiohttp import ClientSession
+
+    adapter, segs = _media_adapter()
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            async with ClientSession() as sess:
+                async with sess.post(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    json={
+                        "chat_id": "group:999",
+                        "kind": "image",
+                        "sources": ["https://example.com/x.png"],
+                    },
+                ) as resp:
+                    assert resp.status == 200
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert len(segs) == 1
+
+
+def test_tools_forward_session_chat(monkeypatch) -> None:
+    """#2: qq_send_* 携带 session_chat（onebot 会话内）→ adapter 判定。"""
+    from onebot_platform import tools
+
+    calls = []
+
+    def fake_http(method, path, payload=None):
+        calls.append(payload)
+        return {"ok": True, "message_id": "m1"}
+
+    monkeypatch.setattr(tools, "_http", fake_http)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "onebot")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "private:555")
+    tools.qq_send_image({"sources": ["/tmp/a.png"], "chat_id": "group:999"})
+    assert calls[0]["session_chat"] == "private:555"
+
+    # 非 onebot 会话（如 CLI）→ 不携带
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    tools.qq_send_voice({"path": "/tmp/a.wav", "chat_id": "group:999"})
+    assert calls[1]["session_chat"] is None
+
+    # onebot 会话但无 chat id → None
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "onebot")
+    tools.qq_send_video({"path": "/tmp/a.mp4", "chat_id": "group:999"})
+    assert calls[2]["session_chat"] is None

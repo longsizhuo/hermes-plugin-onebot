@@ -596,6 +596,43 @@ class OneBotAdapter(BasePlatformAdapter):
             return web.json_response({"status": "error", "error": str(exc)}, status=500)
         return web.json_response({"status": "ok", "data": data})
 
+    def _authorize_cross_chat_send(
+        self, target: str, payload: Dict[str, Any]
+    ) -> Tuple[bool, Optional[str]]:
+        """T11 review #2: restrict explicit cross-chat sends from QQ sessions.
+
+        The tool layer cannot see session roles, so the decision lives here:
+        the qq_send_* tools forward the calling session's chat id as
+        ``session_chat``; when present, an explicit ``chat_id`` is honored
+        only when it is (a) the session's own chat, (b) the configured
+        ``ONEBOT_HOME_CHANNEL``, or (c) the session belongs to an admin user
+        (private chat attributed via ``admin_users``). Group sessions cannot
+        be attributed to a user — fail closed. Requests without session
+        context (CLI, cron, local scripts) keep the previous behavior.
+        """
+        session_chat = str(payload.get("session_chat") or "").strip()
+        if not session_chat:
+            return True, None
+        if session_chat == target:
+            return True, None
+        home = os.environ.get("ONEBOT_HOME_CHANNEL", "").strip()
+        if home and target == home:
+            return True, None
+        try:
+            kind, ident = _split_chat_id(session_chat)
+        except Exception:
+            kind, ident = "", ""
+        if kind == "private" and ident in self._admin_users:
+            return True, None
+        logger.warning(
+            "[onebot] cross-chat send denied: session=%s target=%s", session_chat, target
+        )
+        return False, (
+            "cross-chat send rejected: an explicit chat_id outside the current "
+            "session is only allowed when targeting ONEBOT_HOME_CHANNEL or "
+            "when the session user is an admin"
+        )
+
     async def _handle_send_media(self, request: web.Request) -> web.Response:
         """Media-forwarding endpoint for the qq_send_* tools.
 
@@ -622,6 +659,10 @@ class OneBotAdapter(BasePlatformAdapter):
                 {"status": "error", "error": "chat_id and kind (image/voice/video/file/forward) required"},
                 status=400,
             )
+        # T11 review #2: cross-chat authorization for session-driven sends.
+        allowed, deny_reason = self._authorize_cross_chat_send(chat_id, payload)
+        if not allowed:
+            return web.json_response({"status": "error", "error": deny_reason}, status=403)
         try:
             message_id = None
             if kind == "image":
