@@ -354,6 +354,12 @@ class OneBotAdapter(BasePlatformAdapter):
             self._image_max_size = int(extra.get("image_max_size", 1536))
         except (TypeError, ValueError):
             self._image_max_size = 1536
+        # 一轮里的多张入站图：照片最多这么多张单独附，其余（含表情包）拼成编号网格
+        try:
+            self._image_attach_max = int(extra.get("image_attach_max", 3))
+        except (TypeError, ValueError):
+            self._image_attach_max = 3
+        self._image_grid = bool(extra.get("image_grid", True))
         self._require_mention = bool(extra.get("require_mention", True))
         try:
             self._max_inbound_file_bytes = int(extra.get("max_inbound_file_bytes", MEDIA_MAX_BYTES))
@@ -1471,9 +1477,9 @@ class OneBotAdapter(BasePlatformAdapter):
                             om_text, om_urls, om_types = "", [], []
                         if om_text:
                             text = f"[引用]{om_text}\n{text}".strip()
-                        if om_urls:
-                            media_urls.extend(om_urls)
-                            media_types.extend(om_types)
+                        if om_urls:  # 引用原文在文本里排前面，附图顺序跟着文本走（编号才对得上）
+                            media_urls[:0] = om_urls
+                            media_types[:0] = om_types
                 except Exception as e:
                     logger.info("[onebot] reply quote unavailable id=%s: %s", reply_id, e)
 
@@ -1484,6 +1490,7 @@ class OneBotAdapter(BasePlatformAdapter):
                     self._last_image_path[chat_id] = media_urls[i]
             if not text and not media_urls:
                 return
+            text, media_urls, media_types = await self._budget_pictures(text, media_urls, media_types)
             # T7：/model <序号> 快照改写（仅管理员可达——member 斜杠已在
             # 上方入站门全部拦截，插件错误提示不会发给普通用户）。命中改写
             # 为 ``/model <名> --provider <slug>`` 走网关原生链路；越界/过期
@@ -1688,21 +1695,28 @@ class OneBotAdapter(BasePlatformAdapter):
         """
         media_urls: List[str] = []
         media_types: List[str] = []
-        # 完整解析每个 CQ:image 的 url/file 属性（url 可能为空，需 get_image 换取）
-        for m in _load_onebot_utils()._CQ_IMAGE_ALL_RE.finditer(raw):
+        # 完整解析每个 CQ:image 的 url/file 属性（url 可能为空，需 get_image 换取）；
+        # 每个 CQ:image 记一个占位（成功=待编号字符，失败=[图片]），文本替换时按序取用
+        image_marks: List[str] = []
+        for m in _load_onebot_utils()._CQ_IMAGE_NOURL_RE.finditer(raw):
             attrs = {}
-            for kv in m.group(1).split(","):
+            for kv in m.group(0)[len("[CQ:image"):-1].split(","):
                 if "=" in kv:
                     k, _, v = kv.partition("=")
                     attrs[k.strip()] = _load_onebot_utils()._cq_unescape(v)
             logger.debug("[onebot] CQ:image attrs: %s", attrs)
+            path = None
             try:
                 path = await self._resolve_image(attrs.get("url", ""), attrs.get("file", ""))
-                if path:
-                    media_urls.append(path)
-                    media_types.append("image")
             except Exception as e:
                 logger.debug("[onebot] image download failed: %s", e)
+            if path:
+                media_urls.append(path)
+                media_types.append("image")
+                u = _load_onebot_utils()
+                image_marks.append(u.STICKER_MARK if u.is_sticker("image", attrs) else u.PHOTO_MARK)
+            else:
+                image_marks.append("[图片]")
         # 语音：优先 url 直下；NapCat 私聊语音常无 url（只有 file hash + 容器
         # 内 path），用 get_record API 以 file hash 换取 base64（2026-08-14）
         for m in _load_onebot_utils()._CQ_RECORD_ALL_RE.finditer(raw):
@@ -1733,8 +1747,8 @@ class OneBotAdapter(BasePlatformAdapter):
                 logger.debug("[onebot] voice download failed: %s", e)
 
         u = _load_onebot_utils()
-        text = u._CQ_IMAGE_RE.sub(lambda m: "[图片]", raw)
-        text = u._CQ_IMAGE_NOURL_RE.sub("[图片]", text)
+        marks = iter(image_marks)
+        text = u._CQ_IMAGE_NOURL_RE.sub(lambda m: next(marks, "[图片]"), raw)
         text = u._CQ_RECORD_RE.sub(lambda m: "[语音]", text)
         text = u._CQ_RECORD_NOURL_RE.sub("[语音]", text)
         text = u._CQ_AT_RE.sub(
@@ -1788,17 +1802,23 @@ class OneBotAdapter(BasePlatformAdapter):
             data = seg.get("data") or {}
             if seg_type == "text":
                 text_parts.append(data.get("text", ""))
-            elif seg_type == "image":
+            elif seg_type in ("image", "mface"):
+                # 下载成功放占位字符，组事件前统一编号成 [图片N] / [表情N]；失败保留不带编号的占位
+                u = _load_onebot_utils()
+                sticker = u.is_sticker(seg_type, data)
+                path = None
                 try:
                     path = await self._resolve_image(
-                        data.get("url", ""), data.get("file", "")
+                        data.get("url", ""), data.get("file", "") if seg_type == "image" else ""
                     )
-                    if path:
-                        media_urls.append(path)
-                        media_types.append("image")
                 except Exception as e:
                     logger.debug("[onebot] image resolve failed: %s", e)
-                text_parts.append("[图片]")
+                if path:
+                    media_urls.append(path)
+                    media_types.append("image")
+                    text_parts.append(u.STICKER_MARK if sticker else u.PHOTO_MARK)
+                else:
+                    text_parts.append("[表情]" if sticker else "[图片]")
             elif seg_type == "record":
                 try:
                     r_url = data.get("url", "") or ""
@@ -1854,6 +1874,36 @@ class OneBotAdapter(BasePlatformAdapter):
         text = "".join(text_parts)
         text = re.sub(r"[ \t]+", " ", text).strip()
         return text, media_urls, media_types, reply_id
+
+    async def _budget_pictures(
+        self, text: str, media_urls: List[str], media_types: List[str]
+    ) -> Tuple[str, List[str], List[str]]:
+        """给文本里的图编号；图多时把表情包和超出 image_attach_max 的照片拼成编号网格，
+        附图顺序 = 拼图在前、单独附的原图在后，并在文本末尾说明每张附图是哪几张。"""
+        u = _load_onebot_utils()
+        text, kinds = u.number_pictures(text)
+        images = [i for i, t in enumerate(media_types) if t == "image"]
+        if not self._image_grid or len(kinds) < 2 or len(images) != len(kinds):
+            return text, media_urls, media_types
+        alone, grids = u.plan_pictures(kinds, self._image_attach_max)
+        if not grids:
+            return text, media_urls, media_types
+        paths: List[str] = []
+        try:
+            for group in grids:
+                data = await asyncio.to_thread(
+                    u.make_picture_grid, [media_urls[images[i]] for i in group], [i + 1 for i in group]
+                )
+                out = _ensure_media_dir() / f"grid_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
+                out.write_bytes(data)
+                paths.append(str(out))
+        except Exception as e:  # 拼不成就照旧逐张附
+            logger.warning("[onebot] picture grid failed, attaching one by one: %s", e)
+            return text, media_urls, media_types
+        others = [(p, t) for p, t in zip(media_urls, media_types) if t != "image"]
+        new_urls = paths + [media_urls[images[i]] for i in alone] + [p for p, _ in others]
+        new_types = ["image"] * (len(paths) + len(alone)) + [t for _, t in others]
+        return f"{text}\n{u.picture_note(kinds, alone, grids)}", new_urls, new_types
 
     async def _resolve_image(self, url: str, file: str) -> Optional[str]:
         """把 CQ:image 的 url/file 解析为可读的本地图片路径。

@@ -491,3 +491,21 @@ onebot 插件自 hermes-agent fork 插件线（feat/onebot-platform-v0.22.2，�
 ### 测试
 
 新增 28 用例（媒体过闸 10、chat_id 越权 7、绑定安全+secret 7、plugin-data 迁移与清扫 5，含 conftest 平台注册修复），断言中文串的既有用例同步更新；`cd tests && HERMES_AGENT_HOME=<hermes-agent> python -m pytest test_onebot_platform.py`：**165 passed**（基线 136）。conftest 补丁说明：T9 后仓内捆绑 stub 目录已清空，Platform("onebot") 无法经捆绑目录扫描解析，改为按生产 loader 语义在 conftest 注册 PlatformEntry（production-mirror，非测试专用 hack）。
+
+---
+
+## 17. 入站多图编号 + 拼图（2026-10-22）
+
+一条消息（含被引用的那条）里有多张图时，原来每张都单独下载、单独附给模型：9 个表情包 = 读 9 张图；文本里全是同样的 `[图片]`，模型分不清哪句话对应哪张；商城表情 `mface` 段直接被忽略。
+
+### 改动
+
+- **编号**：解析段数组 / CQ 码时，下载成功的图先放占位字符（照片 / 表情包两种），组事件前 `onebot_utils.number_pictures` 按文本先后换成 `[图片N]` / `[表情N]`。下载失败的仍是不带编号的 `[图片]` / `[表情]`，所以编号和附图一一对应。表情包 = `sub_type=1` 的图片段 + `mface`（新支持，按 url 下载）。
+- **拼图**：`plan_pictures` 决定哪些单独附：照片前 `image_attach_max`（默认 3）张单独附，表情包和超出的照片每 9 张拼成一张 768px 宽、格子带编号的网格图（`make_picture_grid`）。附图顺序拼图在前、原图在后，文本末尾 `picture_note` 说明每张附图是哪几张。只剩 1 张可拼时直接单独附。`image_grid: false` 回到逐张附（编号照旧）。
+- **引用顺序**：被引用消息的图原来追加在本条之后，而 `[引用]` 文本在前；改为插到前面，编号才对得上。`_last_image_path`（/ocr）在拼图之前记录，仍指向真实图片。
+- adapter.py 只新增 `_budget_pictures` 一个方法和解析处的占位；纯逻辑全部在 onebot_utils.py。
+
+### 测试
+
+新增 8 用例（编号、拼图分组、网格尺寸/坏图留空、说明文案、截图 + 表情包端到端、`image_grid: false`、引用图在前、CQ 字符串路径失败占位）。本机缺渲染字体，`test_render_text_image_*` / `test_t2i_render_*` 4 例与改动前同样失败（环境原因）；其余 **169 passed**。
+

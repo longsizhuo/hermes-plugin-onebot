@@ -101,6 +101,8 @@ gateway:
         split_length: 100          # 长回复分段字符数
         text_image_threshold: 150  # 更长回复渲染文字图
         image_max_size: 2048       # 入站图片压缩（0 = 保持原样）
+        image_attach_max: 3        # 每条消息最多几张照片单独附
+        image_grid: true           # 表情包 + 超出的照片拼成一张带编号的图
         poke_reply: false          # bot 自己被戳时轻提示回复
 ```
 
@@ -122,6 +124,8 @@ gateway:
 | `split_length` | `100` | 长回复分段阈值 |
 | `text_image_threshold` | `150` | t2i 卡片阈值；`<=0` 关闭卡片路径 |
 | `image_max_size` | `2048` | 入站图片长边上限（px）；`0` 保持原样 |
+| `image_attach_max` | `3` | 每条消息里单独附的照片数上限，其余进拼图 |
+| `image_grid` | `true` | 表情包和超出 `image_attach_max` 的照片拼成一张带编号的网格图；`false` 每张单独附 |
 | `max_inbound_file_bytes` | `20971520`（20 MB） | 入站文件大小上限；超限降级为 `[文件:name]` 标记 |
 | `interim_recall_seconds` | `90` | 未结算 interim 消息的自动撤回超时（`0` 关闭） |
 | `hot_reload` | `false` | 仅开发用：`onebot_utils.py` / `t2i_render.py` 按 mtime 变化自动 reload（调样式免重启；生产建议关闭，升级时原地写入可能加载半截模块） |
@@ -306,6 +310,8 @@ macOS 什么都不用装（系统自带的 Hiragino Sans GB / Songti SC、Menlo 
 - 入站消息优先按 **OneBot 段数组**（`message` 字段）解析（可用时）。图片/语音/@/表情/视频/文件段结构化处理；文本格式客户端回退 CQ 码字符串解析。CQ 实体反转义（`&amp;` → `&`、`&#91;` → `[` 等）在任何 URL 使用前完成，带 `&` 参数的 CDN 链接能正确下载。
 - 图片下载到临时目录，经 `media_urls` 暴露给视觉工具；下载失败的图片降级为 `[图片]` 占位。图片段只有 `file` hash（无 URL）时，适配器调 OneBot `get_image` 解析真实 URL；`base64://` 和 `file://` 形式直接处理。
 - 超过 `image_max_size`（默认长边 **2048** px）的图片在给 LLM 之前用 Pillow 压缩。QQ 高清照片不压缩会让视觉调用变慢或超时。RGBA 保持 PNG，其余转 JPEG（q85）；动图 GIF 折叠为第一帧。`image_max_size: 0` 保持原样。
+- 文本里的图按先后编号：照片 `[图片N]`，表情包 `[表情N]`（`sub_type=1` 的图片段和商城表情 `mface`），模型能分清谁是谁；下载失败的保留不带编号的 `[图片]` / `[表情]`。引用消息里的图排在前面，和 `[引用]` 文本顺序一致。
+- 一条消息里有多张图时，表情包和超出 `image_attach_max` 的照片拼成一张 768px 宽、每格左上角标编号的网格图（每张最多 9 格）。视觉模型按图计费，9 个表情包拼成一张约等于 1 张图的 token，而不是 9 张。照片（多半是要看清字的截图）仍按 `image_max_size` 单独附。文本末尾附一句说明每张附图是哪几张，拼图在前。只剩 1 张可拼时拼了不省，直接单独附。
 
 ## 入站文件
 

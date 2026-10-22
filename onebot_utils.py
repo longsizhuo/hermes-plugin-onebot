@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
@@ -542,3 +543,87 @@ def expand_model_picker_entries(providers: Any) -> List[Tuple[str, str]]:
         for model in models:
             entries.append((str(model), slug))
     return entries
+
+
+# ── 入站图片：编号 + 拼图（一轮里多张图只读一次）────────────────────────
+#
+# 解析段/CQ 码时，下载成功的图片在文本里先放一个占位字符（照片 / 表情包两种），
+# 组事件前由 number_pictures 统一换成 [图片N] / [表情N]，编号 = 在文本里的先后，
+# 和附图一一对应。下载失败的图仍是不带编号的 [图片] / [表情]。
+#
+# plan_pictures 决定哪些图单独附、哪些拼进一张网格：照片（多半是要看清的截图）
+# 最多 image_attach_max 张单独附；表情包和超出的照片拼成一张 768 宽、格子带编号
+# 的图。视觉模型按图计费，9 个表情包拼成一张 ≈ 1 张图的 token，而不是 9 张。
+
+PHOTO_MARK = ""
+STICKER_MARK = ""
+_PICTURE_MARK_RE = re.compile(f"[{PHOTO_MARK}{STICKER_MARK}]")
+PICTURE_GRID_SIDE = 768
+PICTURE_GRID_MAX = 9
+
+
+def is_sticker(seg_type: str, data: Any) -> bool:
+    """商城表情（mface）和 sub_type=1 的图片段（收藏的表情包）都算表情包。"""
+    return seg_type == "mface" or str((data or {}).get("sub_type", "")) == "1"
+
+
+def number_pictures(text: str) -> Tuple[str, List[str]]:
+    """占位字符按先后换成 [图片N] / [表情N]；返回 (文本, 每张图的种类 "photo"/"sticker")。"""
+    kinds: List[str] = []
+
+    def label(m: "re.Match") -> str:
+        kinds.append("sticker" if m.group(0) == STICKER_MARK else "photo")
+        return f"[{'表情' if kinds[-1] == 'sticker' else '图片'}{len(kinds)}]"
+
+    return _PICTURE_MARK_RE.sub(label, text or ""), kinds
+
+
+def plan_pictures(kinds: List[str], attach_max: int) -> Tuple[List[int], List[List[int]]]:
+    """-> (单独附的图下标, 拼图分组)。照片前 attach_max 张单独附；表情包和超出的照片
+    每 PICTURE_GRID_MAX 张拼一张。只剩 1 张可拼时拼了也不省，直接单独附。"""
+    alone = [i for i, k in enumerate(kinds) if k == "photo"][: max(attach_max, 0)]
+    rest = [i for i in range(len(kinds)) if i not in alone]
+    if len(rest) < 2:
+        return sorted(alone + rest), []
+    return alone, [rest[i : i + PICTURE_GRID_MAX] for i in range(0, len(rest), PICTURE_GRID_MAX)]
+
+
+def make_picture_grid(paths: List[str], labels: List[int]) -> bytes:
+    """一张 JPEG，宽 PICTURE_GRID_SIDE：2–4 张 384px 一格，5–9 张 256px 一格；
+    左上角红底白字写编号。打不开的图留空格。"""
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+    cols = 2 if len(paths) <= 4 else 3
+    cell = PICTURE_GRID_SIDE // cols
+    canvas = Image.new("RGB", (PICTURE_GRID_SIDE, -(-len(paths) // cols) * cell), "white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=20)
+    except Exception:  # Pillow 构建时没带 FreeType：退回位图字体
+        font = ImageFont.load_default()
+    for k, (path, label) in enumerate(zip(paths, labels)):
+        x, y = k % cols * cell, k // cols * cell
+        try:
+            with Image.open(path) as img:  # 动图取第一帧
+                im = ImageOps.contain(img.convert("RGB"), (cell - 4, cell - 4))
+            canvas.paste(im, (x + (cell - im.width) // 2, y + (cell - im.height) // 2))
+        except Exception as e:
+            logger.debug("[onebot] grid cell %s unreadable: %s", label, e)
+        draw.rectangle([x, y, x + cell - 1, y + cell - 1], outline="#bbbbbb")
+        draw.rectangle([x, y, x + 34, y + 26], fill="#d00000")
+        draw.text((x + 7, y + 3), str(label), fill="white", font=font)
+    buf = io.BytesIO()
+    canvas.save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+def picture_note(kinds: List[str], alone: List[int], grids: List[List[int]]) -> str:
+    """告诉模型每张附图是什么：拼图在前，单独附的原图在后。"""
+    tag = lambda i: f"[{'表情' if kinds[i] == 'sticker' else '图片'}{i + 1}]"
+    parts = [
+        f"第 {n} 张附图是 {'、'.join(tag(i) for i in g)} 拼成的一张图，格子左上角的数字就是编号"
+        for n, g in enumerate(grids, 1)
+    ]
+    if alone:
+        parts.append(f"{'其余附图' if grids else '附图'}依次是 {'、'.join(tag(i) for i in alone)}")
+    return f"（{'；'.join(parts)}）"
