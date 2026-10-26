@@ -1896,7 +1896,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.2.0" in t for t in texts)
+    assert any("onebot-plugin v1.3.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -3912,6 +3912,57 @@ def test_tools_forward_session_chat(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "onebot")
     tools.qq_send_video({"path": "/tmp/a.mp4", "chat_id": "group:999"})
     assert calls[2]["session_chat"] is None
+
+
+def test_tools_session_vars_group_cross_chat_denied(monkeypatch) -> None:
+    """R2 review: set_session_vars 真实绑定群会话 → 显式异 chat_id 发送被拒（跨 chat 防护）。"""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from onebot_platform import tools
+
+    adapter, segs = _media_adapter({"admin_users": [111]})
+    tokens = set_session_vars(platform="onebot", chat_id="group:777", chat_type="group")
+    try:
+        async def run():
+            runner, port = await _start_api_server(adapter)
+            try:
+                monkeypatch.setattr(tools, "_BASE", f"http://127.0.0.1:{port}")
+                # blocking urllib call → off the loop or the server can't answer;
+                # to_thread (not run_in_executor) keeps the session ContextVars
+                result = await asyncio.to_thread(
+                    tools.qq_send_image,
+                    {"sources": ["https://example.com/x.png"], "chat_id": "group:999"},
+                )
+                assert "Send failed" in result
+                assert "cross-chat" in result
+            finally:
+                await runner.cleanup()
+
+        asyncio.run(run())
+    finally:
+        clear_session_vars(tokens)
+    assert segs == []
+
+
+def test_tools_session_vars_default_current_chat(monkeypatch) -> None:
+    """R2 review: QQ 会话内省略 chat_id → 默认发到当前会话。"""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from onebot_platform import tools
+
+    calls = []
+
+    def fake_http(method, path, payload=None):
+        calls.append(payload)
+        return {"ok": True, "message_id": "m1"}
+
+    monkeypatch.setattr(tools, "_http", fake_http)
+    tokens = set_session_vars(platform="onebot", chat_id="private:555", chat_type="private")
+    try:
+        result = tools.qq_send_image({"sources": ["https://example.com/x.png"]})
+    finally:
+        clear_session_vars(tokens)
+    assert calls[0]["chat_id"] == "private:555"
+    assert calls[0]["session_chat"] == "private:555"
+    assert "Sent" in result
 
 
 # ── T11 review #4/#5：绑定安全硬失败 + secret_scope 凭证读取 ────────────────

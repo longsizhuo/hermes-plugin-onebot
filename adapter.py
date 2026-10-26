@@ -69,8 +69,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SessionSource,
 )
-from gateway.session import SessionSource
 
 # ---------------------------------------------------------------------------
 # OneBot 11 constants
@@ -111,7 +111,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 # Max bytes for a downloaded voice clip (silk/amr from QQ).
 AUDIO_MAX_BYTES = 15 * 1024 * 1024
@@ -335,7 +335,7 @@ class OneBotAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self._port = DEFAULT_PORT
         self._url = str(extra.get("url", "ws://127.0.0.1:3001"))
-        self._access_token = str(extra.get("access_token", "") or "").strip()
+        self._access_token = _standalone_access_token(extra)
         self._bot_qq = str(extra.get("bot_qq", "") or "").strip()
         _default_split = _load_onebot_utils().DEFAULT_SPLIT_LENGTH
         try:

@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
+from gateway.session_context import get_session_env
+
 logger = logging.getLogger(__name__)
 
 _BASE = os.environ.get("ONEBOT_TOOL_BASE", "http://127.0.0.1:8643").rstrip("/")
@@ -46,9 +48,9 @@ def _resolve_chat(chat_id: Optional[str]) -> str:
     """Explicit chat_id → session chat id (QQ-channel only) → error."""
     if chat_id:
         return chat_id
-    platform = os.environ.get("HERMES_SESSION_PLATFORM", "") or ""
+    platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
     if platform.lower() == "onebot":
-        session_chat = os.environ.get("HERMES_SESSION_CHAT_ID", "") or ""
+        session_chat = get_session_env("HERMES_SESSION_CHAT_ID") or ""
         if session_chat:
             return session_chat
     raise ValueError(
@@ -64,10 +66,10 @@ def _session_chat() -> Optional[str]:
     deciding here it forwards the session context and lets the adapter
     enforce cross-chat authorization (``_authorize_cross_chat_send``).
     """
-    platform = os.environ.get("HERMES_SESSION_PLATFORM", "") or ""
+    platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
     if platform.strip().lower() != "onebot":
         return None
-    return (os.environ.get("HERMES_SESSION_CHAT_ID", "") or "").strip() or None
+    return (get_session_env("HERMES_SESSION_CHAT_ID") or "").strip() or None
 
 
 def _access_token() -> str:

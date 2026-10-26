@@ -491,3 +491,27 @@ onebot 插件自 hermes-agent fork 插件线（feat/onebot-platform-v0.22.2，�
 ### 测试
 
 新增 28 用例（媒体过闸 10、chat_id 越权 7、绑定安全+secret 7、plugin-data 迁移与清扫 5，含 conftest 平台注册修复），断言中文串的既有用例同步更新；`cd tests && HERMES_AGENT_HOME=<hermes-agent> python -m pytest test_onebot_platform.py`：**165 passed**（基线 136）。conftest 补丁说明：T9 后仓内捆绑 stub 目录已清空，Platform("onebot") 无法经捆绑目录扫描解析，改为按生产 loader 语义在 conftest 注册 PlatformEntry（production-mirror，非测试专用 hack）。
+
+---
+
+## 17. T2：Teknium 二轮评审 3 项修复 + 会话绑定测试（2026-10-26，v1.3.0）
+
+上游 PR #140979 二轮评审（teknium1，钉在 commit 88bdc278）给出 2 项阻塞 + 1 项建议，本节逐项落地；版本 1.2.0→1.3.0（PLUGIN_VERSION 与 plugin.yaml 同步）。
+
+### Review 逐项处置
+
+| # | review 意见 | 落点 | 处置 |
+|---|---|---|---|
+| 1 |【阻塞】tools.py 读 HERMES_SESSION_PLATFORM/HERMES_SESSION_CHAT_ID 用 `os.environ`——gateway 里这些是 context vars，进程内调用（非子进程）时 os.environ 读不到真实会话 | tools.py `_resolve_chat` / `_session_chat` 改 `from gateway.session_context import get_session_env`（drop-in os.getenv：ContextVar 优先→os.environ→default，上游 session_context.py:173） | 返回值语义/strip/默认空串不变；os.environ 兜底保留，CLI/子进程场景行为不变 |
+| 2 |【阻塞】adapter.py 私有路径导入 `from gateway.session import SessionSource` | 改并入既有 `from gateway.platforms.base import ...`（base.py re-export SessionSource，公开入口） | 上游 session 内部模块不再是插件依赖面 |
+| 3 |【建议】adapter.py `__init__` 的 `self._access_token` 只读 extra，未走 tools 同源的 secret_scope 回落链 | 改 `self._access_token = _standalone_access_token(extra)`（复用本文件既有函数，定义于 adapter.py:3051） | 凭证读取与 cron 路径（adapter.py:2952 调用点）、tools._access_token 三处同源 |
+
+### 新增测试
+
+- `test_tools_session_vars_group_cross_chat_denied`：`gateway.session_context.set_session_vars(platform="onebot", chat_id="group:777", chat_type="group")` 真实绑定群会话（非 monkeypatch.setenv），qq_send_image 显式传异 chat_id → adapter 跨 chat 防护 403 拒绝（`Send failed` + `cross-chat`，无消息发出）。测试内 blocking urllib 调用走 `asyncio.to_thread`（既不阻塞 aiohttp 事件循环，又保持 ContextVar 对线程可见；run_in_executor 不传播 contextvars，已验证不可用）。
+- `test_tools_session_vars_default_current_chat`（bonus）：QQ 会话绑定下省略 chat_id → 默认发到当前会话（chat_id 与 session_chat 均为绑定值）。
+- 收尾 `clear_session_vars(tokens)` 清理，避免污染其他用例；既有 `/ver` 断言同步 v1.3.0。
+
+### 测试
+
+`cd tests && HERMES_AGENT_HOME=<hermes-agent> pytest test_onebot_platform.py -q`：**167 passed**（基线 165 + 新增 2，0 failed）。
