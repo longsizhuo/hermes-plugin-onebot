@@ -4159,3 +4159,185 @@ def test_cleanup_tmp_files_sweeps_legacy_tmp_dir(monkeypatch) -> None:
     assert not old.exists()
     assert keep.exists()
     assert not legacy_old.exists()
+
+
+# ---------------------------------------------------------------------------
+# SnowLuma 兼容（T1）：ocr_image URL 优先 / 群文件 get_group_file_url 直链 /
+# bot_status·bot_offline notice 静默
+# ---------------------------------------------------------------------------
+
+
+def test_local_command_ocr_prefers_inbound_image_url(monkeypatch) -> None:
+    """SnowLuma：入站图片有 url 时 /ocr 优先传 url，不读 base64。"""
+    from aiohttp import web
+
+    adapter = _make_adapter(admin_users=[123456789])
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+    sent_calls: list = []
+
+    async def fake_call(action, params, timeout=30.0):
+        sent_calls.append((action, params))
+        if action == "ocr_image":
+            assert params["image"].startswith("http://127.0.0.1:")
+            return {"texts": [{"text": "第一行"}]}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+    monkeypatch.setattr(adapter, "_shrink_image", lambda path: None)
+
+    async def fake_base64(path, max_bytes=None):
+        raise AssertionError("_file_to_base64 must not run when a url is cached")
+
+    monkeypatch.setattr(adapter, "_file_to_base64", fake_base64)
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    async def run():
+        app = web.Application()
+
+        async def img(request):
+            return web.Response(body=png, content_type="image/png")
+
+        app.router.add_get("/img.png", img)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            await adapter._process_message(
+                {
+                    "message_type": "private",
+                    "user_id": 123456789,
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {"url": f"http://127.0.0.1:{port}/img.png", "file": "x.png"},
+                        }
+                    ],
+                    "self_id": 123456789,
+                }
+            )
+            await adapter._process_message(
+                {
+                    "message_type": "private",
+                    "user_id": 123456789,
+                    "raw_message": "/ocr",
+                    "message": "/ocr",
+                    "self_id": 123456789,
+                }
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    path = adapter._last_image_path.get("private:123456789", "")
+    assert path and Path(path).exists()
+    assert adapter._image_url_by_path.get(path, "").startswith("http://127.0.0.1:")
+    ocr = [p for a, p in sent_calls if a == "ocr_image"]
+    assert ocr and ocr[0]["image"].startswith("http://127.0.0.1:")
+    texts = [
+        "".join(s.get("data", {}).get("text", "") for s in p[1]["message"])
+        for p in sent_calls
+        if p[0] == "send_msg"
+    ]
+    assert any("OCR 结果" in t and "第一行" in t for t in texts)
+
+
+def _group_file_process(adapter, monkeypatch):
+    """跑一条群聊文件段消息（require_mention 关闭），返回捕获事件列表。"""
+    captured: list = []
+
+    async def fake_handle_message(ev):
+        captured.append(ev)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+    async def run():
+        await adapter._process_message(
+            {
+                "message_type": "group",
+                "group_id": 123456789,
+                "user_id": 123456789,
+                "message": [
+                    {"type": "file", "data": {"file_id": "fid-abc-123", "file": "plan.md", "name": ""}}
+                ],
+                "self_id": 123456789,
+            }
+        )
+
+    asyncio.run(run())
+    return captured
+
+
+def test_group_file_uses_get_group_file_url_direct_link(monkeypatch) -> None:
+    """SnowLuma：群文件优先 get_group_file_url 直链，不调 get_private_file_url。"""
+    adapter = _make_adapter(admin_users=[123456789], require_mention=False)
+    called: list = []
+
+    async def fake_call(action, params, timeout=30.0):
+        called.append((action, params))
+        if action == "get_group_file_url":
+            assert params["group_id"] == 123456789
+            assert params["file_id"] == "fid-abc-123"
+            return {"url": "https://cdn.qq.com/group.md"}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def fake_download(url, safe_name, max_bytes):
+        return "/tmp/hermes_onebot/group.md"
+
+    monkeypatch.setattr(adapter, "_download_file_bytes", fake_download)
+    captured = _group_file_process(adapter, monkeypatch)
+    assert captured
+    assert "[文件:/tmp/hermes_onebot/group.md]" in captured[0].text
+    actions = [a for a, _ in called]
+    assert "get_group_file_url" in actions
+    assert "get_private_file_url" not in actions
+
+
+def test_group_file_get_group_file_url_failure_falls_back_to_get_file(monkeypatch) -> None:
+    """SnowLuma：get_group_file_url 失败 → 回退 get_file base64，消息不阻塞。"""
+    adapter = _make_adapter(admin_users=[123456789], require_mention=False)
+
+    async def fake_call(action, params, timeout=30.0):
+        if action == "get_group_file_url":
+            raise RuntimeError("get_group_file_url unsupported")
+        if action == "get_file":
+            return {"base64": "aGVsbG8=", "file_size": 5}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+    captured = _group_file_process(adapter, monkeypatch)
+    assert captured
+    assert "[文件:" in captured[0].text
+    # T11 review #8: get_file 回退载荷落盘在 plugin-data media 目录
+    assert (
+        str(Path(os.environ["HERMES_HOME"]) / "plugin-data" / "onebot-platform" / "media")
+        in captured[0].text
+    )
+
+
+def test_snowluma_bot_status_and_offline_notices_silently_ignored() -> None:
+    """SnowLuma bot_status/bot_offline：未知 notice_type 静默忽略，不出站不投递。"""
+    adapter = _make_adapter()
+    handled: list = []
+
+    async def fake_handle_message(ev):
+        handled.append(ev)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+    frames = [
+        {"post_type": "notice", "notice_type": "bot_status", "sub_type": "online", "self_id": 10000},
+        {"post_type": "notice", "notice_type": "bot_status", "sub_type": "offline", "self_id": 10000},
+        {"post_type": "notice", "notice_type": "bot_offline", "self_id": 10000},
+    ]
+    for data in frames:
+        sent = asyncio.run(_dispatch_notice_and_collect(adapter, data))
+        assert sent == []
+    assert handled == []

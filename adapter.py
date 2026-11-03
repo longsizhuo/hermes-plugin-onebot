@@ -408,6 +408,9 @@ class OneBotAdapter(BasePlatformAdapter):
         self._chat_interim_overrides: Dict[str, bool] = {}
         # #6 回移：/ocr 用的最近入站图片路径（per chat）
         self._last_image_path: Dict[str, str] = {}
+        # SnowLuma 兼容：ocr_image 只收图片 URL/缓存 file_id——记录入站
+        # 图片 url→本地路径映射（/ocr 有 url 优先传 url，无 url 回退 base64://）
+        self._image_url_by_path: Dict[str, str] = {}
         # ffmpeg 启动探测只做一次（_check_ffmpeg 的实例级防重复 WARNING flag）
         self._ffmpeg_checked = False
         # T5：好友申请/群邀请审批台账（request 事件；flag -> record）。
@@ -1337,6 +1340,7 @@ class OneBotAdapter(BasePlatformAdapter):
             reply_orig: Optional[dict] = None
             reply_fetch_attempted = False
             reply_sender_id: Optional[str] = None
+            group_id = ""
 
             if message_type == "private":
                 if not self._dm_allowed(user_id):
@@ -1400,7 +1404,9 @@ class OneBotAdapter(BasePlatformAdapter):
             message = data.get("message")
             reply_id: Optional[str] = None
             if isinstance(message, list) and message:
-                text, media_urls, media_types, reply_id = await self._parse_message_array(message)
+                text, media_urls, media_types, reply_id = await self._parse_message_array(
+                    message, group_id
+                )
             else:
                 text, media_urls, media_types = await self._parse_content(raw)
                 # CQ 字符串路径: 提取 [CQ:reply,id=xxx]
@@ -1659,12 +1665,22 @@ class OneBotAdapter(BasePlatformAdapter):
             if not path:
                 return "请先在对话里发一张图片，再 /ocr。"
             try:
-                b64 = await self._file_to_base64(path)
-                if not b64:
-                    return "❌ 读取图片失败（文件缺失或超限）。"
-                data = await self._call_action(
-                    "ocr_image", {"image": f"base64://{b64}"}, timeout=30.0
-                )
+                image_url = self._image_url_by_path.get(path, "")
+                if image_url:
+                    # SnowLuma ocr_image 只收图片 URL/缓存 file_id；有 url 优先传 url
+                    logger.info("[onebot] /ocr using inbound image url: %s", image_url)
+                    data = await self._call_action(
+                        "ocr_image", {"image": image_url}, timeout=30.0
+                    )
+                else:
+                    # 无 url（base64 入站或映射缺失）回退 base64://（NapCat 行为）
+                    logger.debug("[onebot] /ocr no cached url, falling back to base64://")
+                    b64 = await self._file_to_base64(path)
+                    if not b64:
+                        return "❌ 读取图片失败（文件缺失或超限）。"
+                    data = await self._call_action(
+                        "ocr_image", {"image": f"base64://{b64}"}, timeout=30.0
+                    )
                 texts = [
                     t.get("text", "")
                     for t in (data.get("texts") or [])
@@ -1768,7 +1784,7 @@ class OneBotAdapter(BasePlatformAdapter):
         return text, media_urls, media_types
 
     async def _parse_message_array(
-        self, segments: List[dict]
+        self, segments: List[dict], group_id: str = ""
     ) -> Tuple[str, List[str], List[str], Optional[str]]:
         """从 OneBot 段数组解析 (text, media_urls, media_types, reply_id)。
 
@@ -1776,6 +1792,7 @@ class OneBotAdapter(BasePlatformAdapter):
         [{"type": "image", "data": {"file": ..., "url": ...}}, ...]。
         结构化解析比 CQ 字符串正则更可靠（图片 url/file 天然可取）。
         第四项为被引用消息的 message_id（reply 段），供调 get_msg 取原图。
+        group_id 为群聊事件顶栏 group_id（群文件 get_group_file_url 用）。
         """
         text_parts: List[str] = []
         media_urls: List[str] = []
@@ -1830,7 +1847,7 @@ class OneBotAdapter(BasePlatformAdapter):
             elif seg_type == "file":
                 fname = data.get("name") or data.get("file") or "文件"
                 try:
-                    fpath = await self._resolve_file(data)
+                    fpath = await self._resolve_file(data, group_id)
                 except Exception as e:
                     logger.debug("[onebot] file resolve failed: %s", e)
                     fpath = None
@@ -1915,6 +1932,9 @@ class OneBotAdapter(BasePlatformAdapter):
                             p.unlink(missing_ok=True)
                     except (OSError, FileNotFoundError):
                         pass
+            # 同步修剪 url 映射里文件已被清理的死条目（防 dict 无界增长）
+            for p in [k for k in self._image_url_by_path if not Path(k).exists()]:
+                self._image_url_by_path.pop(p, None)
         except Exception:
             pass
 
@@ -1940,7 +1960,9 @@ class OneBotAdapter(BasePlatformAdapter):
         # Shrink oversized images BEFORE the LLM sees them — high-res QQ
         # photos make vision calls slow or time out entirely.
         shrunk = await asyncio.to_thread(self._shrink_image, path)
-        return shrunk or str(path)
+        result = shrunk or str(path)
+        self._image_url_by_path[result] = url
+        return result
 
     async def _download_media(self, url: str, kind: str) -> Optional[str]:
         """通用媒体下载（video/audio/file），带大小上限。
@@ -1976,12 +1998,14 @@ class OneBotAdapter(BasePlatformAdapter):
         path.write_bytes(data)
         return str(path)
 
-    async def _resolve_file(self, data: dict) -> Optional[str]:
-        """入站文件双通道获取（dsh-onebot 回移，2026-08-25）。
+    async def _resolve_file(self, data: dict, group_id: str = "") -> Optional[str]:
+        """入站文件多通道获取（dsh-onebot 回移，2026-08-25）。
 
         NapCat 容器内的 get_file 路径对宿主不可达，所以：
-        1. 优先私聊 CDN 直链 get_private_file_url(file_id) → HTTP 下载；
-        2. 回退 get_file 的 base64 / http(s) url 载荷（NapCat 文件服务开启时）。
+        1. 群文件优先标准 get_group_file_url(group_id, file_id) 直链
+           （NapCat/SnowLuma 均支持；group_id 为空即私聊时跳过）；
+        2. 私聊 CDN 直链 get_private_file_url(file_id) → HTTP 下载；
+        3. 回退 get_file 的 base64 / http(s) url 载荷（NapCat 文件服务开启时）。
         成功返回 $HERMES_HOME/plugin-data/onebot-platform/media/ 下的本地路径，失败返回 None。
         """
         fid = data.get("file_id") or data.get("file") or ""
@@ -1990,7 +2014,25 @@ class OneBotAdapter(BasePlatformAdapter):
         safe_name = (data.get("name") or data.get("file") or "file")[:80] or "file"
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", safe_name) or "file"
         max_bytes = self._max_inbound_file_bytes
-        # 1. 私聊直链（不依赖容器内路径）
+        # 1. 群文件直链（SnowLuma 不支持 get_file 覆盖群文件；NapCat 同样适用）
+        if group_id:
+            try:
+                direct = await self._call_action(
+                    "get_group_file_url",
+                    {"group_id": int(group_id), "file_id": fid},
+                    timeout=15.0,
+                )
+                url = direct.get("url") or ""
+                if url:
+                    path = await self._download_file_bytes(url, safe_name, max_bytes)
+                    if path:
+                        logger.info("[onebot] group file fetched via direct link: %s", path)
+                        return path
+            except Exception as e:
+                logger.debug(
+                    "[onebot] get_group_file_url failed (falling back): %s", e
+                )
+        # 2. 私聊直链（不依赖容器内路径）
         try:
             direct = await self._call_action(
                 "get_private_file_url", {"file_id": fid}, timeout=15.0
@@ -2005,7 +2047,7 @@ class OneBotAdapter(BasePlatformAdapter):
             logger.debug(
                 "[onebot] get_private_file_url failed (falling back to get_file): %s", e
             )
-        # 2. get_file：base64 或 http(s) url；容器内路径不可达，忽略
+        # 3. get_file：base64 或 http(s) url；容器内路径不可达，忽略
         try:
             gdata = await self._call_action("get_file", {"file": fid}, timeout=20.0)
             try:

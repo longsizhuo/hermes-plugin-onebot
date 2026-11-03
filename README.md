@@ -2,7 +2,7 @@
 
 > 中文版见 [`README.zh-CN.md`](README.zh-CN.md) · Chinese readme: [`README.zh-CN.md`](README.zh-CN.md)
 
-The OneBot adapter connects Hermes to QQ through the **OneBot 11 protocol**, compatible with [NapCat](https://napneko.github.io/), [Lagrange](https://github.com/LagrangeDev/Lagrange.Core), LLOneBot, and go-cqhttp. Instead of the official QQ Bot platform (which requires a Tencent-approved app), it drives a regular QQ account through a local bridge. Good for personal bots and groups the official platform can't reach.
+The OneBot adapter connects Hermes to QQ through the **OneBot 11 protocol**, compatible with [NapCat](https://napneko.github.io/), [Lagrange](https://github.com/LagrangeDev/Lagrange.Core), LLOneBot, go-cqhttp, and [SnowLuma](https://snowluma.github.io/). Instead of the official QQ Bot platform (which requires a Tencent-approved app), it drives a regular QQ account through a local bridge. Good for personal bots and groups the official platform can't reach.
 
 ```
 User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
@@ -18,7 +18,7 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 | Area | Capability |
 |---|---|
 | Connection | reverse WS (NapCat ws-reverse dials in, default port 8643) or forward WS (dial out, default `ws://127.0.0.1:3001`); auto-reconnect |
-| Inbound | private/group chats, segment-array parsing first (CQ-string fallback), CQ unescaping, @/reply trigger detection (fail-closed), **image resolution (url/base64/file/hash via `get_image`)** + downscale, file/voice/video/face/json/poke segment types, quote original message (`get_msg`), **file dual-channel receive (CDN direct `get_private_file_url` + `get_file` base64/url fallback)**, poke-notice reply when the bot itself is poked (opt-in, `poke_reply`) |
+| Inbound | private/group chats, segment-array parsing first (CQ-string fallback), CQ unescaping, @/reply trigger detection (fail-closed), **image resolution (url/base64/file/hash via `get_image`)** + downscale, file/voice/video/face/json/poke segment types, quote original message (`get_msg`), **file resolution (group CDN direct `get_group_file_url`, private CDN direct `get_private_file_url`, `get_file` base64/url fallback)**, poke-notice reply when the bot itself is poked (opt-in, `poke_reply`) |
 | Voice | ffmpeg → 16 kHz mono WAV → Hermes STT pipeline; voice without a URL fetched via `get_record` (base64); failure degrades to `[语音]` |
 | Text image | AstrBot-style t2i card renderer: headings / bold / italic / strikethrough / quote / list / code block / **table** / inline-code pill / color emoji / CJK punctuation rules; 800 px wide |
 | Outbound | sentence-boundary split (default ≤100 chars), **>150 chars rendered as a t2i card**, markdown stripped to plain text, `[[qq_forward]]` merged forwarding, **loop interim merge + recall** (turn-end **"本轮进展" summary card**, 60 ms recall spacing), typing indicator (private chats) |
@@ -32,7 +32,7 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 | Item | Requirement |
 |---|---|
 | Hermes | gateway with the onebot platform enabled |
-| OneBot 11 bridge | NapCat / Lagrange / LLOneBot / go-cqhttp (reverse or forward WebSocket) |
+| OneBot 11 bridge | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma (reverse or forward WebSocket) |
 | Optional deps | `ffmpeg` on the Hermes host for voice transcription (the adapter probes it once at startup and logs a WARNING — voice STT stays off until you install it); an STT backend configured under `stt:` (local faster-whisper, auto-downloaded on first use, or an OpenAI-compatible API); CJK fonts for text-image cards (see below) |
 
 ## Install (standalone repo)
@@ -42,7 +42,7 @@ This plugin lives in its own repo — install it with the Hermes plugin manager 
 ### Prerequisites
 
 - **Hermes v0.22.2 or newer** — the plugin dependency consent flow described below is part of that release.
-- **A OneBot 11 bridge** (NapCat / Lagrange / LLOneBot / go-cqhttp) that Hermes can reach and that points at this plugin's listener (reverse WS dials into `host:port`; forward WS dials out), with the bridge's access token matching the plugin's `access_token`. Walk-through: the *Configure Hermes* and *NapCat-side setup* sections below.
+- **A OneBot 11 bridge** (NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma) that Hermes can reach and that points at this plugin's listener (reverse WS dials into `host:port`; forward WS dials out), with the bridge's access token matching the plugin's `access_token`. Walk-through: the *Configure Hermes*, *NapCat-side setup* and *SnowLuma-side setup* sections below.
 
 ### Installing
 
@@ -209,6 +209,24 @@ The bridge must be on a network Hermes can reach (same LAN / routable); WS conne
 
 > ⚠️ When NapCat runs on a **different machine than Hermes**, enable the **「文件转 URL」/ file-to-URL** switch in NapCat's network settings (`enableLocalFile2Url`). Without it `get_file` returns container-local paths that Hermes cannot access, and file messages degrade to a `[文件:name]` marker instead of being downloadable.
 
+### SnowLuma-side setup
+
+[SnowLuma](https://snowluma.github.io/) is a TypeScript-runtime OneBot v11 implementation whose extension actions follow NapCat naming, so the adapter works with it directly. Connect it one of two ways:
+
+- **reverse mode (recommended, SnowLuma dials in)**: in SnowLuma's WebUI add a **反向 WebSocket** client:
+  - URL: `ws://<hermes-host>:8643/ws` (use the LAN IP, not `127.0.0.1`, when SnowLuma and Hermes are on different machines)
+  - token: same value as `access_token` on the Hermes side — **required whenever the two are on different machines** (same rule as NapCat above)
+- **forward mode (Hermes dials out)**: set the plugin's `url` to `ws://<snowluma-host>:3001` (SnowLuma's default WS port; its HTTP API sits on 3000) and keep tokens identical.
+
+**Multiple accounts**: SnowLuma keeps one config per UIN, and every UIN claims the same default ports (HTTP 3000 / WS 3001). Add **one independent reverse-WS connection per UIN** (or move each extra account's ports and point a separate forward connection at each).
+
+#### Behavior differences with SnowLuma
+
+- **`/ocr`**: SnowLuma's `ocr_image` only accepts an image **URL or a cached `file_id`**. Inbound images that carry an original URL are passed through as-is; base64-only inbound images (no URL) may not be supported by `/ocr`.
+- **Group files**: SnowLuma's `get_file` only covers the image/voice cache. Group files are resolved through the `get_group_file_url(group_id, file_id)` direct link first, then fall back to `get_file`; private-chat files keep the existing `get_private_file_url` → `get_file` chain.
+- **Video**: SnowLuma has no `get_video_file`; inbound video segments without a URL degrade to a `[视频]` placeholder as usual.
+- **Online/offline events**: SnowLuma pushes `notice_type=bot_status` (`sub_type` `online`/`offline`; kicked accounts send `bot_offline`). The adapter ignores these unknown notice types silently (debug log) — no side effects.
+
 ## dm / group access policy (choose at setup)
 
 Both policies **must be chosen when you first configure the plugin**. The
@@ -337,8 +355,8 @@ macOS needs nothing (system Hiragino Sans GB / Songti SC, Menlo and Apple Color 
 
 Inbound `file` segments are resolved through **two channels** so container-local paths never leak to the agent:
 
-1. **CDN direct link first**: for private chats the adapter calls `get_private_file_url` and downloads the file straight from the QQ CDN.
-2. **`get_file` fallback**: when no direct link is available (group files, or NapCat without the file-to-URL switch), it falls back to `get_file`, accepting base64 or an http URL.
+1. **CDN direct link first**: for group chats the adapter calls `get_group_file_url(group_id, file_id)`; for private chats it calls `get_private_file_url` — in both cases the file is downloaded straight from the QQ CDN.
+2. **`get_file` fallback**: when no direct link is available (or the bridge lacks the file-to-URL switch), it falls back to `get_file`, accepting base64 or an http URL.
 
 The downloaded file is stored under the temp media dir, annotated `[文件:本地路径]` in the message text so the agent can read it locally, and capped by `max_inbound_file_bytes` (default 20 MB). Files over the cap degrade to a plain `[文件:name]` marker. The annotation is skipped for user-level plugins that must stay path-neutral.
 

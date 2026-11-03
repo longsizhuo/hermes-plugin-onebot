@@ -1,6 +1,6 @@
 # QQ（OneBot）
 
-Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot 和 go-cqhttp。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
+Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot、go-cqhttp 和 [SnowLuma](https://snowluma.github.io/)。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
 
 ```
 用户 (QQ) ←→ NapCat ←→ Hermes onebot 适配器 ←→ Hermes agent
@@ -16,7 +16,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 类别 | 能力 |
 |---|---|
 | 连接 | 反向 WS（NapCat ws-reverse 拨入，默认端口 8643）或正向 WS（拨出，默认 `ws://127.0.0.1:3001`）；断线自动重连 |
-| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件段双通道接收（CDN 直链 `get_private_file_url` + `get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
+| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件解析（群文件 CDN 直链 `get_group_file_url`、私聊 CDN 直链 `get_private_file_url`、`get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
 | 语音 | ffmpeg 转 16 kHz 单声道 WAV → Hermes STT 管线；无 URL 语音先经 `get_record`（base64）取；失败降级 `[语音]` |
 | 文字图 | AstrBot 风格 t2i 卡片渲染器：标题/粗体/斜体/删除线/引用/列表/代码块/**表格**/行内 code 胶囊/彩色 emoji/中文标点禁则；800px 宽 |
 | 出站 | 按句号分段（默认 ≤100 字/条）、**>150 字渲染 t2i 文字图卡片**、Markdown 剥离为 QQ 纯文本、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **“本轮进展”小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
@@ -30,7 +30,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 项 | 要求 |
 |---|---|
 | Hermes | 网关启用 onebot 平台 |
-| OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp（反向或正向 WebSocket） |
+| OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma（反向或正向 WebSocket） |
 | 可选依赖 | Hermes 主机上装 `ffmpeg` 用于语音转写（适配器启动时探测一次，缺失即打 WARNING——装上前语音转文字不可用）；`stt:` 下配置 STT 后端（本地 faster-whisper 首次使用自动下载，或 OpenAI 兼容 API）；文字图卡片需要 CJK 字体（见下） |
 
 ## 安装（独立仓）
@@ -40,7 +40,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 ### 前置要求
 
 - **Hermes v0.22.2 或更新**——下述插件依赖同意流程自该版本起提供。
-- **一个 OneBot 11 桥**（NapCat / Lagrange / LLOneBot / go-cqhttp），Hermes 可达且指向本插件的监听地址（reverse WS 由桥拨入 `host:port`；forward WS 由插件拨出），桥的 access token 与插件 `access_token` 一致。操作步骤见下方「配置 Hermes」与「NapCat 侧配置（必做）」两节。
+- **一个 OneBot 11 桥**（NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma），Hermes 可达且指向本插件的监听地址（reverse WS 由桥拨入 `host:port`；forward WS 由插件拨出），桥的 access token 与插件 `access_token` 一致。操作步骤见下方「配置 Hermes」、「NapCat 侧配置（必做）」与「SnowLuma 接入」三节。
 
 ### 安装
 
@@ -196,6 +196,24 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 > ⚠️ NapCat 与 Hermes **不在同一台机器**时，打开 NapCat 网络设置里的 **「文件转 URL」/ file-to-URL** 开关（`enableLocalFile2Url`）。否则 `get_file` 返回的是容器本地路径，Hermes 够不着，文件消息会退化为 `[文件:name]` 标记而无法下载。
 
+### SnowLuma 接入
+
+[SnowLuma](https://snowluma.github.io/) 是 TS 运行时的 OneBot v11 实现，扩展 action 按 NapCat 命名兼容，适配器可直接对接。两种连接方式：
+
+- **reverse 模式（推荐，SnowLuma 拨入）**：在 SnowLuma 的 WebUI 添加一个 **反向 WebSocket** 客户端：
+  - URL：`ws://<hermes-host>:8643/ws`（SnowLuma 与 Hermes 不在同一台机器时用局域网 IP，别用 `127.0.0.1`）
+  - token：与 Hermes 侧 `access_token` 一致——**两者不在同一台机器时必填**（规则同上方 NapCat）
+- **forward 模式（Hermes 拨出）**：把插件的 `url` 设成 `ws://<snowluma-host>:3001`（SnowLuma 默认 WS 端口；其 HTTP API 在 3000），token 保持一致。
+
+**多账号**：SnowLuma 每个 UIN 一份独立配置，且每个 UIN 默认都占用同一组端口（HTTP 3000 / WS 3001）。请**为每个 UIN 单独加一条反向 WebSocket 连接**（或错开每个账号的端口，再为每个账号各建一条 forward 连接）。
+
+#### 与 SnowLuma 的行为差异
+
+- **`/ocr`**：SnowLuma 的 `ocr_image` 只接受图片 **URL 或已缓存的 `file_id`**。入站图片带原始 URL 时按 URL 传递；仅 base64 的入站图片（无 URL）`/ocr` 可能不支持。
+- **群文件**：SnowLuma 的 `get_file` 仅覆盖图片/语音缓存。群文件优先走 `get_group_file_url(group_id, file_id)` 直链解析，失败回退 `get_file`；私聊文件保持既有 `get_private_file_url` → `get_file` 链路。
+- **视频**：SnowLuma 没有 `get_video_file`；入站视频段无 URL 时照常退化为 `[视频]` 占位。
+- **上下线事件**：SnowLuma 会推送 `notice_type=bot_status`（`sub_type` 为 `online`/`offline`；被踢下线发 `bot_offline`）。适配器对这类未知 notice 静默忽略（仅 debug 日志），无副作用。
+
 ## dm / 群访问策略（配置时选定）
 
 两个策略**首次配置时必须各选一个**。默认值只有在你为每个选了三选一之后才有意义：
@@ -311,8 +329,8 @@ macOS 什么都不用装（系统自带的 Hiragino Sans GB / Songti SC、Menlo 
 
 入站 `file` 段走**双通道**解析，容器本地路径不会漏给 agent：
 
-1. **CDN 直链优先**：私聊时适配器调 `get_private_file_url`，直接从 QQ CDN 下载。
-2. **`get_file` 回退**：无直链时（群文件，或 NapCat 没开 file-to-URL 开关），回退 `get_file`，接受 base64 或 http URL。
+1. **CDN 直链优先**：群聊时适配器调 `get_group_file_url(group_id, file_id)`；私聊时调 `get_private_file_url`——两者都直接从 QQ CDN 下载。
+2. **`get_file` 回退**：无直链时（或桥没开 file-to-URL 开关），回退 `get_file`，接受 base64 或 http URL。
 
 下载的文件落在临时媒体目录，消息文本里标注 `[文件:本地路径]` 让 agent 能本地读取，体积受 `max_inbound_file_bytes`（默认 20 MB）限制。超限退化为纯 `[文件:name]` 标记。必须保持路径中立的用户级插件会跳过该标注。
 
