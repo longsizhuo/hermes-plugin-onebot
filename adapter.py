@@ -47,6 +47,7 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -111,7 +112,97 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.6.0"
+
+# ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
+# 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
+# CGNAT/NAT64 地址一律拒绝下载（防 SSRF 打内网），extra.allow_cidrs 提供
+# 受信任内网的白名单逃生口，extra.allow_private_hosts 整体放行（默认关）。
+_PRIVATE_V4_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT
+    ipaddress.ip_network("198.18.0.0/15"),   # benchmark
+    ipaddress.ip_network("192.0.0.0/24"),    # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),    # TEST-NET-1
+    ipaddress.ip_network("240.0.0.0/4"),     # reserved
+]
+# 64:ff9b::/32 同时覆盖 well-known /96 与 RFC 8215 本地位；::ffff:0:0/96 的
+# IPv4-mapped 由 ipv4_mapped 取出内嵌 IPv4 再按 v4 判。
+_PRIVATE_V6_NETS = [
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("64:ff9b::/32"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+_SILK_MAGIC = b"#!SILK_V3"
+
+
+def _is_private_ip(address: str) -> bool:
+    """IP 字面量（v4 或无括号 v6）是否私网/回环/链路本地/CGNAT/NAT64。"""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False  # 非法字面量不按私网处理，交给 DNS 解析路径兜底
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            ip = mapped
+        else:
+            return any(ip in net for net in _PRIVATE_V6_NETS)
+    return any(ip in net for net in _PRIVATE_V4_NETS)
+
+
+def _parse_cidrs(entries: Any) -> list:
+    """extra.allow_cidrs → ip_network 列表；非法条目 fail-loud（拒绝启动）。"""
+    nets = []
+    for entry in entries or []:
+        try:
+            nets.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+        except ValueError as e:
+            raise ValueError(f"onebot: invalid allow_cidrs entry {entry!r}: {e}") from None
+    return nets
+
+
+def _matches_cidr(address: str, nets: list) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip.version == net.version and ip in net for net in nets)
+
+
+def _silk_header_offset(data: bytes) -> int:
+    """SILK v3 魔数偏移；非 SILK 返回 -1。
+
+    协议端落地常把帧类型字节（0x02/0x03）写在头部（回移 dsh PR #29 口径），
+    不剥掉的话 ffmpeg 对未知内容探测会失败。
+    """
+    offset = 1 if len(data) > 0 and data[0] in (0x02, 0x03) else 0
+    if len(data) >= offset + len(_SILK_MAGIC) and data[offset : offset + len(_SILK_MAGIC)] == _SILK_MAGIC:
+        return offset
+    return -1
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    """按文件头魔数判图片扩展名（回移 dsh PR #11）：GIF/WebP 表情不再一律存 .jpg。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"GIF":
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return ""
 
 # Max bytes for a downloaded voice clip (silk/amr from QQ).
 AUDIO_MAX_BYTES = 15 * 1024 * 1024
@@ -350,6 +441,19 @@ class OneBotAdapter(BasePlatformAdapter):
             self._image_max_size = int(extra.get("image_max_size", 1536))
         except (TypeError, ValueError):
             self._image_max_size = 1536
+        # 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20）：allow_cidrs 白名单
+        # 逃生口（非法条目 fail-loud 拒绝启动）；allow_private_hosts 整体
+        # 放行私网目标（信任内网协议端场景，默认关）。
+        self._allow_cidrs = _parse_cidrs(extra.get("allow_cidrs"))
+        self._allow_private_hosts = bool(extra.get("allow_private_hosts", False))
+        # t2i 卡片 PNG 体积上限（base64 长度，回移 dsh outboundImageMaxBytes）：
+        # 超限告警并回退整段文本，不发超大图。
+        try:
+            self._outbound_image_max_bytes = int(
+                extra.get("outbound_image_max_bytes", IMAGE_MAX_BYTES)
+            )
+        except (TypeError, ValueError):
+            self._outbound_image_max_bytes = IMAGE_MAX_BYTES
         self._require_mention = bool(extra.get("require_mention", True))
         try:
             self._max_inbound_file_bytes = int(extra.get("max_inbound_file_bytes", MEDIA_MAX_BYTES))
@@ -778,7 +882,14 @@ class OneBotAdapter(BasePlatformAdapter):
                     (s if s.startswith(("http://", "https://")) else f"file://{s}", "")
                     for s in sources
                 ]
-                await self.send_multiple_images(chat_id=chat_id, images=images)
+                # 回移 dsh PR #25/#28：caption 与出站管线同源清洗（** 加粗 **
+                # 不再原样发到 QQ），清洗后为空按既有丢弃语义不发送。
+                caption = _load_onebot_utils().strip_markdown(
+                    str(payload.get("caption") or "")
+                ).strip() or None
+                await self.send_multiple_images(
+                    chat_id=chat_id, images=images, caption=caption
+                )
             elif kind == "voice":
                 path = str(payload.get("path") or "")
                 if not path:
@@ -1985,20 +2096,86 @@ class OneBotAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _resolve_host(self, host: str) -> List[str]:
+        """DNS 全记录解析（含 IPv4/IPv6 混合），返回地址字面量列表。"""
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, None)
+        return [info[4][0] for info in infos]
+
+    async def _assert_downloadable_url(self, url: str) -> None:
+        """入站媒体下载 SSRF 闸（回移 dsh PR #8/#20）。
+
+        仅允许 http(s)；URL 主机为 IP 字面量时直接判私网，否则 DNS 全记录
+        解析后逐个判。命中私网/回环/链路本地/CGNAT/NAT64 且不在
+        allow_cidrs 白名单 → 抛 ValueError（调用方降级并打 WARNING）。
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"protocol not allowed ({parsed.scheme or 'empty'})")
+        host = (parsed.hostname or "").strip("[]")
+        if not host:
+            raise ValueError("missing host")
+        if self._allow_private_hosts:
+            return
+        blocked = f"private/loopback address not allowed ({url!r})"
+        if _is_private_ip(host) and not _matches_cidr(host, self._allow_cidrs):
+            raise ValueError(blocked)
+        addresses = await self._resolve_host(host)
+        for addr in addresses:
+            if _is_private_ip(addr) and not _matches_cidr(addr, self._allow_cidrs):
+                raise ValueError(f"{host!r} resolves to a {blocked}")
+
+    async def _fetch_url(
+        self, url: str, timeout_total: float, what: str
+    ) -> Optional[Tuple[bytes, Any]]:
+        """带 SSRF 闸的 GET：手动跟随重定向并逐跳过闸（防 302 打内网）。
+
+        返回 (data, resp)；非 200 / 闸拒绝 / 重定向过多返回 None（拒绝时
+        打 WARNING——静默降级会掩盖配置错误）。
+        """
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        timeout = aiohttp.ClientTimeout(total=timeout_total)
+        current = url
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                for _hop in range(5):
+                    await self._assert_downloadable_url(current)
+                    async with session.get(current, allow_redirects=False) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("Location", "")
+                            if not location:
+                                logger.warning("[onebot] %s download: redirect without Location", what)
+                                return None
+                            current = urllib.parse.urljoin(current, location)
+                            continue
+                        if resp.status != 200:
+                            return None
+                        data = await resp.read()
+                        return data, resp.headers
+            logger.warning("[onebot] %s download: too many redirects", what)
+            return None
+        except ValueError as e:
+            logger.warning("[onebot] %s download refused: %s", what, e)
+            return None
+        except Exception as e:
+            logger.warning("[onebot] %s download failed: %s", what, e)
+            return None
+
     async def _download_image(self, url: str) -> Optional[str]:
         if not url or url.lower().startswith("base64://"):
             return None
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-        timeout = aiohttp.ClientTimeout(total=20.0)
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.read()
+        fetched = await self._fetch_url(url, 20.0, "image")
+        if fetched is None:
+            return None
+        data, resp_headers = fetched
         if len(data) > IMAGE_MAX_BYTES:
             logger.debug("[onebot] image too large, skipping (%d bytes)", len(data))
             return None
-        ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "")) or ".jpg"
+        # 文件头魔数优先（GIF/WebP 表情不再一律存 .jpg，dsh PR #11），
+        # Content-Type 兜底，最后 .jpg。
+        ext = _sniff_image_ext(data)
+        if not ext:
+            ext = mimetypes.guess_extension(resp_headers.get("Content-Type", "")) or ".jpg"
         if ext == ".jpe":
             ext = ".jpg"
         tmp = _ensure_media_dir()
@@ -2020,24 +2197,21 @@ class OneBotAdapter(BasePlatformAdapter):
         if not url:
             return None
         max_bytes = MEDIA_MAX_BYTES
-        resp = None
+        resp_headers: Any = None
         if url.lower().startswith("base64://"):
             try:
                 data = base64.b64decode(url[len("base64://"):])
             except Exception:
                 return None
         else:
-            headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-            timeout = aiohttp.ClientTimeout(total=30.0)
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.read()
+            fetched = await self._fetch_url(url, 30.0, kind)
+            if fetched is None:
+                return None
+            data, resp_headers = fetched
         if len(data) > max_bytes:
             logger.debug("[onebot] %s too large, skipping (%d bytes)", kind, len(data))
             return None
-        ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "")) if resp else ""
+        ext = mimetypes.guess_extension(resp_headers.get("Content-Type", "")) if resp_headers else ""
         if not ext or ext == ".jpe":
             ext = ".mp4" if kind == "video" else ".bin"
         tmp = _ensure_media_dir()
@@ -2133,13 +2307,10 @@ class OneBotAdapter(BasePlatformAdapter):
                 except Exception:
                     return None
             else:
-                headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-                timeout = aiohttp.ClientTimeout(total=30.0)
-                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            return None
-                        data = await resp.read()
+                fetched = await self._fetch_url(url, 30.0, "file")
+                if fetched is None:
+                    return None
+                data, _headers = fetched
             if not data:
                 return None
             if max_bytes > 0 and len(data) > max_bytes:
@@ -2258,20 +2429,24 @@ class OneBotAdapter(BasePlatformAdapter):
             except Exception:
                 return None
         else:
-            headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-            timeout = aiohttp.ClientTimeout(total=25.0)
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.read()
+            fetched = await self._fetch_url(url, 25.0, "voice")
+            if fetched is None:
+                return None
+            data, _headers = fetched
         if len(data) > AUDIO_MAX_BYTES:
             logger.debug("[onebot] voice too large, skipping (%d bytes)", len(data))
             return None
 
         tmp = _ensure_media_dir()
         stem = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-        in_path = tmp / f"voice_{stem}.bin"
+        # 回移 dsh PR #29：SILK v3 先判魔数（协议端落地常带 0x02/0x03 帧
+        # 类型前缀字节），命中则剥前缀并落 .silk 扩展名，不给 ffmpeg 留
+        # 按扩展名/内容硬猜的坑；非 SILK 维持 .bin 交给内容探测。
+        silk_offset = _silk_header_offset(data)
+        if silk_offset > 0:
+            data = data[silk_offset:]
+        suffix = ".silk" if silk_offset >= 0 else ".bin"
+        in_path = tmp / f"voice_{stem}{suffix}"
         out_path = tmp / f"voice_{stem}.wav"
         in_path.write_bytes(data)
         try:
@@ -2432,20 +2607,29 @@ class OneBotAdapter(BasePlatformAdapter):
                         render_text_image, raw_content, title
                     )
                     b64 = base64.b64encode(png_bytes).decode("ascii")
-                    image_params = dict(params)
-                    image_params["message"] = [
-                        {"type": "image", "data": {"file": f"base64://{b64}"}}
-                    ] + media_segments
-                    data = await self._call_action("send_msg", image_params)
-                    mid = data.get("message_id")
-                    if _buf_sent_flag and mid is not None:
-                        _buf_sent_ids.append((str(mid), raw_content))
-                    # t2i 结果发送完成后撤回原 interim（合并转发已在内容前发出）
-                    if is_final:
-                        await self._recall_loop_buffer(chat_id)
-                    return SendResult(
-                        success=True, message_id=str(mid) if mid is not None else None
-                    )
+                    # 回移 dsh outboundImageMaxBytes：PNG 超限不发送，告警后
+                    # 落到整段单条文本回退（与渲染失败同路）。
+                    if len(b64) > self._outbound_image_max_bytes:
+                        logger.warning(
+                            "[onebot] t2i card PNG exceeds outbound_image_max_bytes "
+                            "(%d > %d) — falling back to single text",
+                            len(b64), self._outbound_image_max_bytes,
+                        )
+                    else:
+                        image_params = dict(params)
+                        image_params["message"] = [
+                            {"type": "image", "data": {"file": f"base64://{b64}"}}
+                        ] + media_segments
+                        data = await self._call_action("send_msg", image_params)
+                        mid = data.get("message_id")
+                        if _buf_sent_flag and mid is not None:
+                            _buf_sent_ids.append((str(mid), raw_content))
+                        # t2i 结果发送完成后撤回原 interim（合并转发已在内容前发出）
+                        if is_final:
+                            await self._recall_loop_buffer(chat_id)
+                        return SendResult(
+                            success=True, message_id=str(mid) if mid is not None else None
+                        )
                 except Exception as e:
                     logger.warning(
                         "[onebot] text-image render failed (%s) — falling back to single text", e
@@ -2922,8 +3106,12 @@ class OneBotAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        caption: Optional[str] = None,
     ) -> None:
-        """批量图片: file:// → base64, http(s):// → URL 直发; 一条消息最多 9 图."""
+        """批量图片: file:// → base64, http(s):// → URL 直发; 一条消息最多 9 图.
+
+        caption（已清洗）附着在第一条消息开头（dsh qq_send_image 同形状）。
+        """
         from urllib.parse import unquote
 
         segs: List[Dict[str, Any]] = []
@@ -2942,7 +3130,10 @@ class OneBotAdapter(BasePlatformAdapter):
         for i in range(0, len(segs), 9):
             batch = segs[i : i + 9]
             if batch:
-                await self._send_media(chat_id, batch)
+                # caption 只随第一条消息发出（分批 >9 张时后续批不带）。
+                await self._send_media(
+                    chat_id, batch, caption=caption if i == 0 else None
+                )
 
     async def send_voice(
         self,

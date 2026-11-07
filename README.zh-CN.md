@@ -16,12 +16,12 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 类别 | 能力 |
 |---|---|
 | 连接 | 反向 WS（NapCat ws-reverse 拨入，默认端口 8643）或正向 WS（拨出，默认 `ws://127.0.0.1:3001`）；断线自动重连 |
-| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件解析（群文件 CDN 直链 `get_group_file_url`、私聊 CDN 直链 `get_private_file_url`、`get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
+| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、**按文件头魔数定扩展名 + SSRF 下载闸（拒私网/CGNAT/NAT64，`allow_cidrs` 逃生口）**、**SILK v3 魔数先判再转码**、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件解析（群文件 CDN 直链 `get_group_file_url`、私聊 CDN 直链 `get_private_file_url`、`get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
 | 语音 | ffmpeg 转 16 kHz 单声道 WAV → Hermes STT 管线；无 URL 语音先经 `get_record`（base64）取；失败降级 `[语音]` |
 | 文字图 | AstrBot 风格 t2i 卡片渲染器：标题/粗体/斜体/删除线/引用/列表/代码块/**表格**/行内 code 胶囊/彩色 emoji/中文标点禁则；800px 宽 |
 | 出站 | 两档发送、**不再自动分段**（≤ 阈值单条文本、超阈值渲染 t2i 卡片）、Markdown 剥离为 QQ 纯文本、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **“本轮进展”小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
 | 命令 | 管理员本地斜杠命令：`/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`；其余斜杠照常流转网关核心 |
-| 工具 | `qq_send_image`（≤9 张，路径或 URL）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_send_segments`（显式分条 1–9 段，自行拆好每段）、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media`；`provides_tools` 让 CLI/TUI 也可用 |
+| 工具 | `qq_send_image`（≤9 张，路径或 URL，caption 剥离 Markdown）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_send_segments`（显式分条 1–9 段，自行拆好每段）、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media`；`provides_tools` 让 CLI/TUI 也可用 |
 | 权限 | 管理员白名单（`ONEBOT_ALLOWED_USERS`）、dm/group 策略（open/allowlist/disabled）、群聊 @ 门控、受限成员 `[受限用户:仅问答]` 软限制、出站敏感意图审计 |
 | 运维 | 热加载 `onebot_utils.py` / `t2i_render.py`（`extra.hot_reload`，免网关重启）、临时媒体 TTL 清理、启动时 t2i 墨源自检（字体链自测） |
 
@@ -122,6 +122,9 @@ gateway:
 | `image_max_size` | `2048` | 入站图片长边上限（px）；`0` 保持原样 |
 | `max_inbound_file_bytes` | `20971520`（20 MB） | 入站文件大小上限；超限降级为 `[文件:name]` 标记 |
 | `interim_recall_seconds` | `90` | 未结算 interim 消息的自动撤回超时（`0` 关闭） |
+| `outbound_image_max_bytes` | `8388608`（8 MB） | t2i 卡片 PNG 上限（base64 长度）；超限告警并回退整段单条文本 |
+| `allow_cidrs` | `[]` | SSRF 闸白名单逃生口：列内私网地址仍可下载（如受信任内网协议端）；非法条目拒绝启动 |
+| `allow_private_hosts` | `false` | 整体绕过入站媒体 SSRF 闸（私网/回环/CGNAT/NAT64 过滤）；仅限受信任同机部署 |
 | `hot_reload` | `false` | 仅开发用：`onebot_utils.py` / `t2i_render.py` 按 mtime 变化自动 reload（调样式免重启；生产建议关闭，升级时原地写入可能加载半截模块） |
 | `poke_reply` | `false` | bot 自己被戳（`notify/poke` notice）时回复轻提示（`@我` / `/help`）；成员互戳不响应；per-chat 60s 冷却 |
 

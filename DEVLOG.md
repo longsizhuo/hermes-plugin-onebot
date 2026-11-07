@@ -646,3 +646,25 @@ fonts.ts 的多平台候选口径为**文件路径版**（本仓是 PIL 按路�
 - Linux CI / 容器行为零变化（候选序与文件完全同前）。
 
 版本 1.5.0 → 1.5.1（plugin.yaml / PLUGIN_VERSION / /ver 断言三处同步）。
+
+## 21. P0 批次回移：caption 清洗 / PNG 上限 / 魔数扩展名 / SILK / SSRF（2026-11-07，v1.6.0）
+
+差距盘点（对照 dsh 源码逐项核实）后用户裁决先做 P0 五项。
+
+### 逐项
+
+| # | 项 | 来源 | 落点 |
+|---|---|---|---|
+| 1 | qq_send_image caption 出站同源清洗 + **顺手修复 caption 被静默丢弃的 bug**（`/api/send_media` image 分支从未把 payload.caption 传给 send_multiple_images） | PR #25/#28 | 端点清洗（strip_markdown，空则不发送）+ `send_multiple_images(caption=)` 新参，caption 附着首条消息开头（dsh 同形状），>9 张分批时只随首条 |
+| 2 | t2i 卡片 PNG 体积上限：b64 长度 > `outbound_image_max_bytes`（默认 8MB）→ WARNING + 回退整段单条文本 | outboundImageMaxBytes | send() t2i 块 |
+| 3 | 入站图片扩展名按文件头魔数（PNG/GIF/WebP/JPG/BMP），Content-Type 兜底——GIF/WebP 表情不再一律存 .jpg | PR #11 | `_sniff_image_ext()` + `_download_image` |
+| 4 | SILK v3 魔数先判：命中剥 0x02/0x03 帧类型前缀字节、落 `.silk` 扩展名再交 ffmpeg；非 SILK 维持 `.bin` 内容探测（本仓 .bin 路径本无 dsh 那个 .mp3 强制解 bug，此项补前缀容忍 + 确定性探测） | PR #29 | `_silk_header_offset()` + `_download_audio` |
+| 5 | 入站媒体下载 SSRF 闸：仅 http(s)；IP 字面量私网直拒，域名 DNS 全记录逐个判；拦 v4 私网/回环/link-local/CGNAT(100.64/10)/benchmark(198.18/15)/TEST-NET/reserved(240/4)，v6 `::1`/NAT64(64:ff9b::/32)/link-local(fe80::/10)/ULA(fc00::/7)/IPv4-mapped（取内嵌 v4 再判）；**手动跟随重定向并逐跳重过闸**（防 302 打内网）；`extra.allow_cidrs` 白名单逃生口（非法条目 fail-loud 拒绝启动）、`extra.allow_private_hosts` 总开关（默认关）。四个下载函数（image/voice/media/file）全走 `_fetch_url`；base64:// 不经闸 | PR #8/#20 | `_assert_downloadable_url` / `_fetch_url` / `_is_private_ip` / `_parse_cidrs` |
+
+说明：dsh PR #21 的 fileRefRoots 不适用——本仓入站不处理 file:// URL（下载闸直接拒非 http(s)）；#22 的体积上限本仓已有（IMAGE_MAX_BYTES / MEDIA_MAX_BYTES / `_max_inbound_file_bytes`）。
+
+### 测试（新增 8，全绿）
+
+`_silk_header_offset` / `_sniff_image_ext` / `_is_private_ip`+`_parse_cidrs`+`_matches_cidr` / `_assert_downloadable_url`（字面量/DNS mock/白名单/总开关/协议拒绝）/ `_download_image` 拒绝降级 / `_fetch_url` 重定向逐跳过闸（本地 302 服务器实证）/ caption 清洗+空丢弃（端到端）/ PNG 超限回退。**180 passed + 4 skipped**（172 + 8，零回归；`test_local_command_ocr_prefers_inbound_image_url` 因 SSRF 闸拦 loopback 改 `allow_private_hosts=True`——其主题是 URL 优先级）。
+
+新配置键：`outbound_image_max_bytes`（默认 8388608）、`allow_cidrs`（[]）、`allow_private_hosts`（false）。版本 1.5.1 → 1.6.0。

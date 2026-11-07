@@ -1852,6 +1852,201 @@ def test_api_send_media_segments_validation(monkeypatch) -> None:
     assert "markdown strip" in cases[4][1]["error"]
 
 
+# ---------------------------------------------------------------------------
+# P0 批次（v1.6.0 回移）：caption 清洗 / PNG 上限 / 魔数扩展名 / SILK / SSRF
+# ---------------------------------------------------------------------------
+
+
+def test_silk_header_offset_detection() -> None:
+    """SILK v3 魔数判定（dsh PR #29 口径）：允许 0x02/0x03 帧类型前缀。"""
+    from onebot_platform.adapter import _silk_header_offset
+
+    magic = b"#!SILK_V3\n..."
+    assert _silk_header_offset(magic) == 0
+    assert _silk_header_offset(b"\x02" + magic) == 1
+    assert _silk_header_offset(b"\x03" + magic) == 1
+    assert _silk_header_offset(b"\x89PNG\r\n\x1a\n....") == -1
+    assert _silk_header_offset(b"#!SILK_V2") == -1
+    assert _silk_header_offset(b"") == -1
+
+
+def test_sniff_image_ext_by_magic() -> None:
+    """入站图片按文件头定扩展名（dsh PR #11）：GIF/WebP 不再一律 .jpg。"""
+    from onebot_platform.adapter import _sniff_image_ext
+
+    assert _sniff_image_ext(b"\x89PNG\r\n\x1a\nrest") == ".png"
+    assert _sniff_image_ext(b"GIF89a....") == ".gif"
+    assert _sniff_image_ext(b"GIF87a....") == ".gif"
+    assert _sniff_image_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == ".webp"
+    assert _sniff_image_ext(b"\xff\xd8\xff\xe0rest") == ".jpg"
+    assert _sniff_image_ext(b"BM\x36\x00\x00\x00") == ".bmp"
+    assert _sniff_image_ext(b"not an image at all") == ""
+
+
+def test_is_private_ip_and_cidr_allowlist() -> None:
+    """SSRF 闸地址判定（dsh PR #8/#20 口径）：私网/CGNAT/NAT64/mapped 全拦。"""
+    from onebot_platform.adapter import _is_private_ip, _matches_cidr, _parse_cidrs
+
+    for addr in (
+        "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.1.1",
+        "100.64.0.1", "198.18.0.1", "240.0.0.1", "0.1.2.3",
+        "::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1", "64:ff9b::1.2.3.4",
+    ):
+        assert _is_private_ip(addr), addr
+    for addr in ("8.8.8.8", "1.1.1.1", "2606:4700::1111"):
+        assert not _is_private_ip(addr), addr
+    nets = _parse_cidrs(["10.0.0.0/8", "192.168.5.0/24"])
+    assert _matches_cidr("10.1.2.3", nets)
+    assert _matches_cidr("192.168.5.77", nets)
+    assert not _matches_cidr("8.8.8.8", nets)
+    with pytest.raises(ValueError, match="allow_cidrs"):
+        _parse_cidrs(["not-a-cidr"])
+
+
+def test_assert_downloadable_url_blocks_private(monkeypatch) -> None:
+    """下载闸：IP 字面量私网直拒、DNS 解析到私网直拒、白名单/总开关放行。"""
+    adapter = _make_adapter(allow_cidrs=["10.0.0.0/8"])
+    # IP 字面量私网 → 拒；白名单命中 → 放行
+    with pytest.raises(ValueError, match="private/loopback"):
+        asyncio.run(adapter._assert_downloadable_url("http://192.168.1.1/a.jpg"))
+    asyncio.run(adapter._assert_downloadable_url("http://10.1.2.3/a.jpg"))
+    # 非法协议 → 拒
+    with pytest.raises(ValueError, match="protocol not allowed"):
+        asyncio.run(adapter._assert_downloadable_url("file:///etc/passwd"))
+    # 域名解析到私网 → 拒（mock getaddrinfo，不碰真实网络）
+    async def fake_resolve(host):
+        return ["192.168.1.1"]
+
+    monkeypatch.setattr(adapter, "_resolve_host", fake_resolve)
+    with pytest.raises(ValueError, match="resolves to a private/loopback"):
+        asyncio.run(adapter._assert_downloadable_url("http://cdn.example.com/a.jpg"))
+    # 总开关放行
+    adapter_open = _make_adapter(allow_private_hosts=True)
+    asyncio.run(adapter_open._assert_downloadable_url("http://192.168.1.1/a.jpg"))
+
+
+def test_download_image_refused_private_returns_none() -> None:
+    """闸拒绝时优雅降级为 None（入站占位符路径），不抛出不联网。"""
+    adapter = _make_adapter()
+    assert asyncio.run(adapter._download_image("http://127.0.0.1:9/secret.png")) is None
+
+
+def test_fetch_url_revalidates_each_redirect_hop(monkeypatch) -> None:
+    """重定向逐跳过闸：302 萳到私网时第二跳被拒（防 302 打内网）。"""
+    import aiohttp
+    from aiohttp import web
+
+    from onebot_platform import adapter as adapter_mod
+
+    adapter = _make_adapter()
+    hops: list = []
+
+    async def fake_assert(url: str) -> None:
+        hops.append(url)
+        if len(hops) >= 2:
+            raise ValueError("private/loopback address not allowed (redirect target)")
+
+    monkeypatch.setattr(adapter, "_assert_downloadable_url", fake_assert)
+
+    async def start(request):
+        raise web.HTTPFound("/final")
+
+    async def final(request):
+        return web.Response(body=b"secret")
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/start", start)
+        app.router.add_get("/final", final)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            return await adapter._fetch_url(f"http://127.0.0.1:{port}/start", 10.0, "test")
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run()) is None
+    assert len(hops) == 2, "重定向目标必须重新过闸"
+
+
+def test_send_image_caption_cleaned_and_dropped(monkeypatch) -> None:
+    """回移 PR #25/#28：caption 出站同源清洗；清洗后为空则整段不发送。"""
+    import urllib.request
+
+    adapter = _make_adapter()
+    sent: list = []
+
+    async def fake_call(action, params, timeout=15.0):
+        sent.append(params)
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def run(caption):
+        import concurrent.futures
+
+        runner, port = await _start_api_server(adapter)
+        try:
+            payload = json.dumps(
+                {
+                    "chat_id": "group:888888",
+                    "kind": "image",
+                    "sources": ["http://example.com/a.png"],
+                    "caption": caption,
+                }
+            ).encode()
+
+            def post():
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+
+            # 同步 urllib 放线程池，避免阻塞服务所在的 loop（既有口径）
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return await loop.run_in_executor(pool, post)
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run("**标题**\n正文")) == 200
+    # 一条消息：清洗后的 caption 文本在首位，图片段在后
+    message = sent[0]["message"]
+    assert message[0] == {"type": "text", "data": {"text": "标题\n正文"}}
+    assert message[1]["type"] == "image"
+    # 清洗后为空 → 只有图片段
+    assert asyncio.run(run("~~ ~~")) == 200
+    assert sent[1]["message"][0]["type"] == "image"
+
+
+def test_t2i_card_png_too_large_falls_back(monkeypatch) -> None:
+    """回移 dsh outboundImageMaxBytes：PNG 超限不发送，回退整段单条文本。"""
+    from onebot_platform import adapter as adapter_mod
+
+    def big_render(text, title=None):
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 4096
+
+    monkeypatch.setattr(adapter_mod, "render_text_image", big_render)
+    adapter = _make_adapter(text_image_threshold=10, outbound_image_max_bytes=100)
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+
+    result = asyncio.run(adapter.send("private:1", "很长" * 20))
+    assert result.success
+    assert len(ws.sent) == 1
+    segs = ws.sent[0]["params"]["message"]
+    assert segs[0]["type"] == "text"
+    assert all(seg["type"] != "image" for seg in segs)
+    assert segs[0]["data"]["text"] == "很长" * 20
+
+
 async def _start_api_server(adapter):
     """起一个只挂 onebot API 路由的本地服务，返回 (runner, port)。"""
     from aiohttp import web
@@ -2045,7 +2240,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.5.1" in t for t in texts)
+    assert any("onebot-plugin v1.6.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -4382,7 +4577,9 @@ def test_local_command_ocr_prefers_inbound_image_url(monkeypatch) -> None:
     """SnowLuma：入站图片有 url 时 /ocr 优先传 url，不读 base64。"""
     from aiohttp import web
 
-    adapter = _make_adapter(admin_users=[123456789])
+    # 本测试主题是 URL 优先级；本地回环测试服务器经 allow_private_hosts
+    # 放行（SSRF 闸默认会拦 loopback，见 test_assert_downloadable_url_*）。
+    adapter = _make_adapter(admin_users=[123456789], allow_private_hosts=True)
     ws = _FakeWS(adapter)
     adapter._ws = ws
     sent_calls: list = []
