@@ -112,7 +112,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.7.0"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
@@ -511,6 +511,17 @@ class OneBotAdapter(BasePlatformAdapter):
         # SnowLuma 兼容：ocr_image 只收图片 URL/缓存 file_id——记录入站
         # 图片 url→本地路径映射（/ocr 有 url 优先传 url，无 url 回退 base64://）
         self._image_url_by_path: Dict[str, str] = {}
+        # 回移 dsh rateLimitPerMinute：每 chat 60s 滑动窗口普通消息频控
+        try:
+            self._rate_limit_per_minute = int(extra.get("rate_limit_per_minute", 30))
+        except (TypeError, ValueError):
+            self._rate_limit_per_minute = 30
+        self._rate_times: Dict[str, List[float]] = {}
+        self._rate_notice_at: Dict[str, float] = {}
+        self._rate_notice_tasks: set = set()
+        # 宿主 clarify 工具的 QQ 提问卡记录：clarify_id -> (chat_id, message_id)
+        # （retire_clarify_card 撤回原提问用，v1.7.0 回移 dsh PR #30 口径）
+        self._clarify_cards: Dict[str, Tuple[str, str]] = {}
         # ffmpeg 启动探测只做一次（_check_ffmpeg 的实例级防重复 WARNING flag）
         self._ffmpeg_checked = False
         # T5：好友申请/群邀请审批台账（request 事件；flag -> record）。
@@ -1309,20 +1320,26 @@ class OneBotAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[onebot] admin notify to %s failed: %s", admin, e)
 
-    async def _handle_request_decision(self, action: str, arg: str) -> str:
+    async def _handle_request_decision(
+        self, action: str, arg: str, chat_type: str = "dm"
+    ) -> Optional[str]:
         """/approve /reject 共享实现：解析引用 → 幂等/未知检查 → 调 API。
 
         同一 flag 已处理过 → 幂等回复，不重复调 API；API 失败不改台账
         状态（可重试）。序号引用沿"最近一次通知列表"语义（seq 见通知）。
+        返回 None = 引用未命中 QQ 申请台账——可能是宿主 exec-approval 的
+        ``/approve [session|always|<id>]``（#17 验证发现被本命令吞掉），
+        透传网关交核心审批文本拦截处理。
         """
         u = _load_onebot_utils()
         approve = action == "approve"
         ref = str(arg or "").strip()
-        if not ref:
-            return f"用法：/{action} <flag或序号>"
-        record = u.resolve_request_ref(ref, list(self._requests.values()))
+        record = u.resolve_request_ref(ref, list(self._requests.values())) if ref else None
         if record is None:
-            return f"❌ 未找到待处理的申请：{ref}（可用通知里的序号或完整 flag）"
+            return None
+        if chat_type != "dm":
+            # QQ 申请台账含申请人信息，不在群里处理/泄露
+            return "请在 bot 私聊中执行审批命令。"
         flag = record["flag"]
         verdict = "同意" if approve else "拒绝"
         if record.get("status") == "processed":
@@ -1610,6 +1627,14 @@ class OneBotAdapter(BasePlatformAdapter):
                             await self.send(chat_id, reply)
                             return
 
+            # 回移 dsh rateLimitPerMinute：每 chat 60s 滑动窗口普通消息频控。
+            # 斜杠命令（本地已处理返回；其余交网关核心）不计入也不受限；
+            # 超限丢弃且每窗口至多一条提示。
+            _cmd_probe = re.sub(r"^@\d+\s*", "", (text or "").lstrip())
+            if not _cmd_probe.startswith("/") and self._rate_limited(chat_id):
+                logger.info("[onebot] message rate-limited and dropped: %s", chat_id)
+                return
+
             # 群聊普通用户：注入受限标记（agent 侧软限制依据）
             if role == "member" and chat_type == "group" and text:
                 text = f"[受限用户:仅问答]\n{text}"
@@ -1792,11 +1817,7 @@ class OneBotAdapter(BasePlatformAdapter):
             # 入口在 _process_message 的 admin 门之后；此处兜底防非 admin 直调
             if user_id not in self._admin_users:
                 return "❌ 仅管理员可执行审批命令。"
-            if chat_type != "dm":
-                # 群内不执行审批：确认回复含申请人 QQ（台账内容），
-                # 发到群里会泄露；也不调审批 API（防误触他人消息）。
-                return "请在 bot 私聊中执行审批命令。"
-            return await self._handle_request_decision(cmd, arg)
+            return await self._handle_request_decision(cmd, arg, chat_type)
         if cmd == "id":
             return f"chat_id: {chat_id}\nuser_id: {user_id}"
         if cmd == "ver":
@@ -1862,19 +1883,22 @@ class OneBotAdapter(BasePlatformAdapter):
         """
         media_urls: List[str] = []
         media_types: List[str] = []
+        u = _load_onebot_utils()
+        # 回移 dsh PR #44：表情包（sub_type=1）占自己的位置——下载成功换
+        # [表情包:<本地路径>]，失败留 [表情包]，不再冒充 [图片]。
+        sticker_labels: Dict[tuple, str] = {}
         # 完整解析每个 CQ:image 的 url/file 属性（url 可能为空，需 get_image 换取）
-        for m in _load_onebot_utils()._CQ_IMAGE_ALL_RE.finditer(raw):
-            attrs = {}
-            for kv in m.group(1).split(","):
-                if "=" in kv:
-                    k, _, v = kv.partition("=")
-                    attrs[k.strip()] = _load_onebot_utils()._cq_unescape(v)
+        for m in u._CQ_IMAGE_ALL_RE.finditer(raw):
+            attrs = u._cq_attrs(m.group(1))
             logger.debug("[onebot] CQ:image attrs: %s", attrs)
+            is_sticker = str(attrs.get("sub_type", "") or "") == "1"
             try:
                 path = await self._resolve_image(attrs.get("url", ""), attrs.get("file", ""))
                 if path:
                     media_urls.append(path)
                     media_types.append("image")
+                    if is_sticker:
+                        sticker_labels[m.span()] = f"[表情包:{path}]"
             except Exception as e:
                 logger.debug("[onebot] image download failed: %s", e)
         # 语音：优先 url 直下；NapCat 私聊语音常无 url（只有 file hash + 容器
@@ -1906,9 +1930,9 @@ class OneBotAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("[onebot] voice download failed: %s", e)
 
-        u = _load_onebot_utils()
-        text = u._CQ_IMAGE_RE.sub(lambda m: "[图片]", raw)
-        text = u._CQ_IMAGE_NOURL_RE.sub("[图片]", text)
+        text = u._CQ_IMAGE_ALL_RE.sub(
+            lambda m: sticker_labels.get(m.span(), "[图片]"), raw
+        )
         text = u._CQ_RECORD_RE.sub(lambda m: "[语音]", text)
         text = u._CQ_RECORD_NOURL_RE.sub("[语音]", text)
         text = u._CQ_AT_RE.sub(
@@ -1934,7 +1958,28 @@ class OneBotAdapter(BasePlatformAdapter):
         text = u._CQ_FILE_RE.sub(u._cq_file_text, text)
         text = u._CQ_VIDEO_RE.sub("[视频]", text)
         text = u._CQ_FORWARD_RE.sub(lambda m: f"[合并转发:{m.group(1)}]", text)
-        text = u._CQ_JSON_RE.sub("[卡片]", text)
+        # 卡片（json/xml 段）→ [卡片:可读字段 · 链接]（回移 dsh PR #45）；
+        # mface 表情包 → 下载成功 [表情包:<本地路径>]，否则 [表情包]（PR #44）
+        for m in u._CQ_JSON_RE.finditer(raw):
+            card = u.card_from_json(u._cq_attrs(m.group(1) or "").get("data", ""))
+            text = text.replace(m.group(0), card)
+        for m in u._CQ_XML_RE.finditer(raw):
+            card = u.card_from_xml(u._cq_attrs(m.group(1) or "").get("data", ""))
+            text = text.replace(m.group(0), card)
+        for m in u._CQ_MFACE_RE.finditer(raw):
+            attrs = u._cq_attrs(m.group(1) or "")
+            label = "[表情包]"
+            if attrs.get("url") or attrs.get("file"):
+                try:
+                    mpath = await self._resolve_image(attrs.get("url", ""), attrs.get("file", ""))
+                except Exception as e:
+                    logger.debug("[onebot] mface resolve failed: %s", e)
+                    mpath = None
+                if mpath:
+                    media_urls.append(mpath)
+                    media_types.append("image")
+                    label = f"[表情包:{mpath}]"
+            text = text.replace(m.group(0), label)
         text = u._CQ_POKE_RE.sub("[戳一戳]", text)
         text = u._CQ_ANY_RE.sub("", text)
         text = re.sub(r"[ \t]+", " ", text).strip()
@@ -1964,6 +2009,9 @@ class OneBotAdapter(BasePlatformAdapter):
             if seg_type == "text":
                 text_parts.append(data.get("text", ""))
             elif seg_type == "image":
+                # 回移 dsh PR #44：sub_type=1 是表情包——占自己的位置
+                # （[表情包:<本地路径>]），不再冒充 [图片]。
+                is_sticker = str(data.get("sub_type", data.get("sub-type", "")) or "") == "1"
                 try:
                     path = await self._resolve_image(
                         data.get("url", ""), data.get("file", "")
@@ -1973,7 +2021,11 @@ class OneBotAdapter(BasePlatformAdapter):
                         media_types.append("image")
                 except Exception as e:
                     logger.debug("[onebot] image resolve failed: %s", e)
-                text_parts.append("[图片]")
+                    path = None
+                if is_sticker:
+                    text_parts.append(f"[表情包:{path}]" if path else "[表情包]")
+                else:
+                    text_parts.append("[图片]")
             elif seg_type == "record":
                 try:
                     r_url = data.get("url", "") or ""
@@ -2022,7 +2074,27 @@ class OneBotAdapter(BasePlatformAdapter):
                 reply_id = str(data.get("id", "") or "")
                 # 用户偏好不显示引用文本，仅记录 id 供取原图
             elif seg_type == "json":
-                text_parts.append("[卡片]")
+                text_parts.append(_load_onebot_utils().card_from_json(data.get("data", "")))
+            elif seg_type == "xml":
+                text_parts.append(_load_onebot_utils().card_from_xml(data.get("data", "")))
+            elif seg_type == "mface":
+                # Market 表情包：有 url 就解析成本地路径并占自己的位置（PR #44）
+                if data.get("url") or data.get("file"):
+                    try:
+                        mpath = await self._resolve_image(
+                            data.get("url", ""), data.get("file", "")
+                        )
+                    except Exception as e:
+                        logger.debug("[onebot] mface resolve failed: %s", e)
+                        mpath = None
+                    if mpath:
+                        media_urls.append(mpath)
+                        media_types.append("image")
+                        text_parts.append(f"[表情包:{mpath}]")
+                    else:
+                        text_parts.append("[表情包]")
+                else:
+                    text_parts.append("[表情包]")
             elif seg_type == "poke":
                 text_parts.append("[戳一戳]")
             # 未知段类型: 忽略
@@ -2851,6 +2923,71 @@ class OneBotAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         kind, target = _split_chat_id(chat_id)
         return {"name": chat_id, "type": "group" if kind == "group" else "dm"}
+
+    # ── 宿主 clarify 工具的 QQ 呈现（v1.7.0，参考 dsh PR #30 口径）────────
+    # base 默认实现（编号选项文本 + text-intercept 捕获回复）已可用；这里
+    # 只叠加 QQ 特有部分：记录提问消息 id，非点击结束（超时/会话重置/被
+    # 自由文本取代）时撤回原提问气泡并补通知。
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        result = await super().send_clarify(
+            chat_id, question, choices, clarify_id, session_key, metadata
+        )
+        mid = getattr(result, "message_id", None)
+        if mid:
+            self._clarify_cards[clarify_id] = (chat_id, str(mid))
+        return result
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """clarify 未点击结束：撤回原提问气泡，notice 发为普通消息。"""
+        entry = self._clarify_cards.pop(clarify_id, None)
+        if entry and entry[1].isdigit():
+            try:
+                await self._call_action(
+                    "delete_msg", {"message_id": int(entry[1])}, timeout=10.0
+                )
+            except Exception as e:
+                logger.debug("[onebot] clarify card recall failed: %s", e)
+        if notice and entry:
+            try:
+                await self.send(entry[0], notice)
+            except Exception as e:
+                logger.debug("[onebot] clarify retire notice failed: %s", e)
+
+    # ── 入站 per-chat 频控（回移 dsh rateLimitPerMinute）───────────────────
+    def _rate_limited(self, chat_id: str) -> bool:
+        """60s 滑动窗口普通消息频控；超限丢弃，每窗口至多一条提示。
+
+        斜杠命令（本地/网关）由调用方豁免不计入；rate_limit_per_minute
+        <= 0 关闭。
+        """
+        limit = self._rate_limit_per_minute
+        if limit <= 0:
+            return False
+        now = time.time()
+        times = self._rate_times.setdefault(chat_id, [])
+        times[:] = [t for t in times if now - t < 60.0]
+        if len(self._rate_times) > 512:
+            # 防呆：冷 chat 的窗口表整体清掉（活跃 chat 会随访问重建）
+            for stale in [c for c, ts in self._rate_times.items() if not ts]:
+                self._rate_times.pop(stale, None)
+        if len(times) < limit:
+            times.append(now)
+            return False
+        if now - self._rate_notice_at.get(chat_id, 0.0) >= 60.0:
+            self._rate_notice_at[chat_id] = now
+            task = asyncio.create_task(self._send_rate_notice(chat_id))
+            # 持引用防 GC（fire-and-forget 任务无引用可能被回收不执行）
+            self._rate_notice_tasks.add(task)
+            task.add_done_callback(self._rate_notice_tasks.discard)
+        return True
+
+    async def _send_rate_notice(self, chat_id: str) -> None:
+        try:
+            await self.send(chat_id, "⏳ 消息太频繁，请稍后再试。")
+        except Exception as e:
+            logger.debug("[onebot] rate-limit notice send failed: %s", e)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show the QQ "typing…" bubble — NapCat `set_input_status`.

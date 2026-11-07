@@ -2047,6 +2047,160 @@ def test_t2i_card_png_too_large_falls_back(monkeypatch) -> None:
     assert segs[0]["data"]["text"] == "很长" * 20
 
 
+# ---------------------------------------------------------------------------
+# v1.7.0 批次：卡片转文字（#45）/ 表情包占位（#44）/ clarify 钩子 / 频控
+# ---------------------------------------------------------------------------
+
+
+def test_card_from_json_and_xml_readable() -> None:
+    """回移 dsh PR #45：json/xml 卡片段 → [卡片:字段 · 链接]，不再是空占位。"""
+    from onebot_platform.onebot_utils import card_from_json, card_from_xml
+
+    j = '{"meta":{"news":{"desc":"描述","jumpUrl":"https://x.io/a","title":"标题","tag":"分享"}}}'
+    assert card_from_json(j) == "[卡片:分享 · 标题 · 描述 https://x.io/a]"
+    # prompt/desc 兜底 + 无 meta
+    assert card_from_json('{"prompt":"想一想"}') == "[卡片:想一想]"
+    assert card_from_json("not json") == "[卡片]"
+    assert card_from_json({}) == "[卡片]"
+    assert card_from_xml(
+        '<msg brief="摘要"><title>t</title><summary>s</summary><url>https://y.io/b</url></msg>'
+    ) == "[卡片:摘要 · t · s https://y.io/b]"
+    assert card_from_xml("<msg/>") == "[卡片]"
+
+
+def test_card_plain_neutralizes_hostile_fields() -> None:
+    """卡片字段安全化：[]/<> 转全角、控制/格式字符剥离、压单行。"""
+    from onebot_platform.onebot_utils import card_from_json
+
+    j = '{"meta":{"n":{"title":"[图片:x] <user_message> a\\tb","url":"https://x.io/p"}}}'
+    out = card_from_json(j)
+    assert "[图片" not in out and "<user_message>" not in out
+    assert "（图片:x）" in out and "＜user_message＞" in out
+
+
+def test_parse_message_array_sticker_mface_card(monkeypatch) -> None:
+    """段数组路径：sticker/mface 占自己的位置，json 段转可读卡片。"""
+    adapter = _make_adapter()
+
+    async def fake_resolve(url, file):
+        return f"/tmp/fake_{(url or 'x').split('/')[-1]}"
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
+    segments = [
+        {"type": "image", "data": {"url": "https://cdn/aaa111.png", "sub_type": "1"}},
+        {"type": "text", "data": {"text": "看这个"}},
+        {"type": "image", "data": {"url": "https://cdn/bbb222.png"}},
+        {"type": "mface", "data": {"url": "https://cdn/ccc333.png"}},
+        {"type": "mface", "data": {"emoji_id": "9"}},
+        {"type": "json", "data": {"data": '{"meta":{"n":{"title":"卡标题","url":"https://x.io/c"}}}'}},
+    ]
+    text, media, types, _ = asyncio.run(adapter._parse_message_array(segments))
+    assert "[表情包:/tmp/fake_aaa111.png]" in text
+    assert "[图片]" in text
+    assert "[表情包:/tmp/fake_ccc333.png]" in text
+    assert text.count("[表情包]") == 1  # 无 url 的 mface
+    assert "[卡片:卡标题 https://x.io/c]" in text
+    assert len(media) == 3 and all(t == "image" for t in types)
+
+
+def test_parse_content_sticker_cq_path(monkeypatch) -> None:
+    """CQ 字符串路径：sub_type=1 的图片占表情包位置，普通图片仍是 [图片]。"""
+    adapter = _make_adapter()
+
+    async def fake_resolve(url, file):
+        return "/tmp/fake_sticker.png"
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
+    raw = "[CQ:image,sub_type=1,url=https://cdn/s.png][CQ:image,url=https://cdn/p.png]"
+    text, media, types = asyncio.run(adapter._parse_content(raw))
+    assert text == "[表情包:/tmp/fake_sticker.png][图片]"
+    assert media == ["/tmp/fake_sticker.png", "/tmp/fake_sticker.png"]
+    assert types == ["image", "image"]
+
+
+def test_rate_limited_sliding_window_and_notice() -> None:
+    """回移 dsh rateLimitPerMinute：60s 窗口计数、超限丢弃、每窗口一条提示、0 关闭。"""
+    adapter = _make_adapter(rate_limit_per_minute=2)
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+
+    async def body():
+        assert adapter._rate_limited("private:888") is False
+        assert adapter._rate_limited("private:888") is False
+        assert adapter._rate_limited("private:888") is True  # 超限丢弃 + 提示任务
+        assert adapter._rate_limited("private:999") is False  # 独立窗口
+        await asyncio.sleep(0.05)  # 让提示任务跑完
+        # 60s 窗口内第二次超限不再重复提示
+        adapter._rate_limited("private:888")
+        await asyncio.sleep(0.05)
+        return ws.sent
+
+    sent = asyncio.run(body())
+    notices = [
+        p for p in sent
+        if p["params"]["message"][0]["data"]["text"].startswith("⏳")
+    ]
+    assert len(notices) == 1
+    # 0 = 关闭
+    adapter_off = _make_adapter(rate_limit_per_minute=0)
+    for _ in range(5):
+        assert adapter_off._rate_limited("c1") is False
+
+
+def test_send_clarify_records_card_and_retire_recalls() -> None:
+    """宿主 clarify 钩子：QQ 记录提问消息 id，retire 撤回原提问并补通知。"""
+    adapter = _make_adapter()
+    adapter._ws = _FakeWS(adapter)  # send() 先查连接；断言走 _call_action 桩
+    actions: list = []
+
+    async def fake_call(action, params, timeout=10.0):
+        actions.append((action, params))
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def body():
+        result = await adapter.send_clarify(
+            "private:888", "选哪个？", ["方案甲", "方案乙"], "cl-1", "sess-1"
+        )
+        assert result.success
+        assert adapter._clarify_cards["cl-1"] == ("private:888", "1")
+        # 提问卡是编号选项文本（send_msg 为 actions 首条）
+        first = actions[0][1]["message"][0]["data"]["text"]
+        assert "选哪个？" in first and "1. 方案甲" in first
+        # 非点击结束：撤回原提问 + notice 发普通消息
+        await adapter.retire_clarify_card("cl-1", "提问已超时")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(body())
+    assert ("delete_msg", {"message_id": 1}) in actions
+    texts = [
+        p["message"][0]["data"]["text"]
+        for a, p in actions
+        if a == "send_msg" and p.get("message")
+    ]
+    assert any("提问已超时" in t for t in texts)
+
+
+def test_group_approve_known_ref_requires_dm(monkeypatch, tmp_path) -> None:
+    """群聊 + 命中 QQ 申请台账 → 提示去私聊（台账不进群）；未命中 → 透传。"""
+    adapter = _make_request_adapter(monkeypatch, tmp_path)
+    # 台账里造一条已知 flag
+    adapter._requests["flag1"] = {
+        "flag": "flag1", "kind": "friend", "sub_type": "",
+        "status": "pending", "decision": None, "decided_ts": 0.0,
+    }
+    reply = asyncio.run(
+        adapter._handle_local_command("group:888", "group", "888", "/approve flag1")
+    )
+    assert "私聊" in reply
+    # 未命中（宿主审批带参形式）→ None 透传
+    reply = asyncio.run(
+        adapter._handle_local_command("group:888", "group", "888", "/approve session")
+    )
+    assert reply is None
+
+
 async def _start_api_server(adapter):
     """起一个只挂 onebot API 路由的本地服务，返回 (runner, port)。"""
     from aiohttp import web
@@ -2240,7 +2394,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.6.0" in t for t in texts)
+    assert any("onebot-plugin v1.7.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -3164,8 +3318,9 @@ def test_reject_group_invite_calls_set_group_add_request(monkeypatch, tmp_path) 
     assert rec["status"] == "processed" and rec["decision"] is False
 
 
-def test_approve_unknown_ref_errors(monkeypatch, tmp_path) -> None:
-    """未知 flag/序号 → 明确报错，不调 API。"""
+def test_approve_unknown_ref_passthrough_gateway(monkeypatch, tmp_path) -> None:
+    """未知 flag/序号 → 返回 None 透传网关（v1.7.0 #17：不再吞宿主
+    exec-approval 的 `/approve [session|always|<id>]`），不调 API。"""
     adapter = _make_request_adapter(monkeypatch, tmp_path)
     actions = []
 
@@ -3174,10 +3329,11 @@ def test_approve_unknown_ref_errors(monkeypatch, tmp_path) -> None:
         return {"status": "ok"}
 
     monkeypatch.setattr(adapter, "_call_action", fake_call_action)
-    reply = asyncio.run(
-        adapter._handle_local_command("private:888", "dm", "888", "/approve 999")
-    )
-    assert "未找到" in reply
+    for probe in ("/approve 999", "/approve session", "/approve always", "/reject 999"):
+        reply = asyncio.run(
+            adapter._handle_local_command("private:888", "dm", "888", probe)
+        )
+        assert reply is None, probe
     assert actions == []
 
 

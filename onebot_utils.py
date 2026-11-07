@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
-from typing import Any, List, Optional, Tuple
+import unicodedata
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +32,154 @@ _CQ_FACE_RE = re.compile(r"\[CQ:face,id=(\d+)\]")
 # 无 name 参数（标准 OneBot 的 name 在 NapCat 里不出现），文件名取 file= 值
 _CQ_FILE_RE = re.compile(r"\[CQ:file,([^\]]*)\]")
 _CQ_VIDEO_RE = re.compile(r"\[CQ:video(?:,[^\]]*)?\]")
-_CQ_JSON_RE = re.compile(r"\[CQ:json(?:,[^\]]*)?\]")
+_CQ_JSON_RE = re.compile(r"\[CQ:json(?:,([^\]]*))?\]")
+_CQ_XML_RE = re.compile(r"\[CQ:xml(?:,([^\]]*))?\]")
+_CQ_MFACE_RE = re.compile(r"\[CQ:mface(?:,([^\]]*))?\]")
 _CQ_POKE_RE = re.compile(r"\[CQ:poke(?:,[^\]]*)?\]")
 _CQ_ANY_RE = re.compile(r"\[CQ:[^\]]*\]")
+
+
+def _cq_attrs(cq_match: str) -> Dict[str, str]:
+    """解析 [CQ:type,k=v,...] 的属性串（不含 type 部分）；容错无 = 的段。"""
+    attrs: Dict[str, str] = {}
+    for kv in cq_match.split(","):
+        if "=" in kv:
+            k, _, v = kv.partition("=")
+            attrs[k.strip()] = _cq_unescape(v)
+    return attrs
+
+
+# ── QQ 卡片（json/xml 段）转可读文字（回移 dsh PR #45）─────────────────
+# json 段一律 [卡片]、xml 段 [xml]，别人分享的歌/视频/群邀请/小程序内容全丢。
+# 取写给人看的字段和一个 http(s) 链接，写成 [卡片:标题 · 描述 · url]。
+_CARD_TEXT_KEYS = ("tag", "source", "title", "nickname", "name", "desc", "contact", "address", "text", "content")
+_CARD_LINK_KEYS = ("qqdocurl", "jumpUrl", "jumpurl", "jump_url", "doc_url", "url")
+CARD_PLACEHOLDER = "[卡片]"
+_CARD_MAX_FIELD = 160
+_CARD_MAX_TEXT = 360
+_CARD_MAX_FIELDS = 5
+_CARD_MAX_LINK = 200
+# 链接里不允许空白/尖括号/方括号/控制/格式字符（线性扫描，防恶意输入）
+_CARD_LINK_RE = re.compile(
+    r"https?://[^\s<>\"\[\]\x00-\x1f\x7f\u200b-\u200f\u2028\u2029\ufeff]+", re.I
+)
+
+
+def _card_unescape(value: str) -> str:
+    """CQ + XML 转义逐层还原（嵌套 &amp;#91; 一并展开，dsh cardUnescape 口径）。"""
+    return _cq_unescape(re.sub(r"&(?:amp;)+", "&", value or "")).replace(
+        "&lt;", "<"
+    ).replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'")
+
+
+def _card_cap_chars(text: str, max_chars: int) -> str:
+    return text if len(text) <= max_chars else text[:max_chars].rstrip()
+
+
+def _card_plain(value: str) -> str:
+    """卡片字段压成单行安全文本。
+
+    卡片是别人写的：方括号会冒充本插件自己的 [图片:path] 标记抢媒体槽，
+    尖括号会冒充 user_message 边界，控制/格式字符能藏字——全部处理。
+    """
+    chars: List[str] = []
+    for ch in _card_unescape(value):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        if cat == "Cc":
+            chars.append(" ")
+        else:
+            chars.append(ch)
+    flat = (
+        "".join(chars)
+        .replace("<", "＜")
+        .replace(">", "＞")
+        .replace("[", "（")
+        .replace("]", "）")
+    )
+    flat = re.sub(r"\s+", " ", flat).strip()
+    return _card_cap_chars(flat, _CARD_MAX_FIELD)
+
+
+def _card_strings(source: Any, keys) -> List[str]:
+    if not isinstance(source, dict):
+        return []
+    return [source[key] for key in keys if isinstance(source.get(key), str)]
+
+
+def _card_text(fields: List[str], links: List[str]) -> str:
+    kept = list(dict.fromkeys(f for f in fields if f))[:_CARD_MAX_FIELDS]
+    link = next(
+        (u for u in links if len(u) <= _CARD_MAX_LINK and _CARD_LINK_RE.fullmatch(u)), ""
+    )
+    parts = [_card_cap_chars(" · ".join(kept), _CARD_MAX_TEXT), link]
+    body = " ".join(p for p in parts if p)
+    return CARD_PLACEHOLDER if not body else f"[卡片:{body}]"
+
+
+def card_from_json(raw: Any) -> str:
+    """json 卡片段 → [卡片:字段 · 链接]（dsh PR #45 口径）。
+
+    取 meta 首个对象的文本字段，无则再深一层，然后 prompt、desc；
+    链接取 meta 对象（含内层）的跳转键。无可读内容回 [卡片]。
+    """
+    card = raw
+    if isinstance(card, str):
+        try:
+            card = json.loads(card)
+        except Exception:
+            return CARD_PLACEHOLDER
+    if not isinstance(card, dict):
+        return CARD_PLACEHOLDER
+    meta = card.get("meta")
+    block = (
+        next((v for v in meta.values() if isinstance(v, dict)), None)
+        if isinstance(meta, dict)
+        else None
+    )
+    inner = (
+        next((v for v in block.values() if isinstance(v, dict)), None)
+        if isinstance(block, dict)
+        else None
+    )
+
+    def plain(source: Any, keys) -> List[str]:
+        return [t for t in (_card_plain(s) for s in _card_strings(source, keys)) if t]
+
+    for fields in (
+        plain(block, _CARD_TEXT_KEYS),
+        plain(inner, _CARD_TEXT_KEYS),
+        plain(card, ("prompt",)),
+        plain(card, ("desc",)),
+    ):
+        if fields:
+            links = _card_strings(block, _CARD_LINK_KEYS) + _card_strings(inner, _CARD_LINK_KEYS)
+            return _card_text(fields, links)
+    return _card_text([], [])
+
+
+def card_from_xml(raw: Any) -> str:
+    """xml 卡片段 → [卡片:brief/title/summary · url]（dsh PR #45 口径）。
+
+    [^<>]/[^<] 截断保证对恶意输入仍是线性扫描。
+    """
+    if not isinstance(raw, str):
+        return CARD_PLACEHOLDER
+
+    def attr(name: str) -> str:
+        m = re.search(r"(?:\s|^)" + name + r'=(?:"([^"]*)"|\'([^\']*)\')', raw)
+        if not m:
+            return ""
+        return m.group(1) if m.group(1) is not None else (m.group(2) or "")
+
+    def tag(name: str) -> str:
+        m = re.search(r"<" + name + r"\b[^<>]*>([^<]*)</" + name + r">", raw)
+        return m.group(1) if m else ""
+
+    fields = [_card_plain(attr("brief")), _card_plain(tag("title")), _card_plain(tag("summary"))]
+    # 链接：url= 属性与 <url> 标签两种落点都收（属性优先）
+    return _card_text(fields, [attr("url"), tag("url")])
 
 
 def _cq_file_text(m: "re.Match") -> str:

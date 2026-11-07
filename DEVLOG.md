@@ -668,3 +668,51 @@ fonts.ts 的多平台候选口径为**文件路径版**（本仓是 PIL 按路�
 `_silk_header_offset` / `_sniff_image_ext` / `_is_private_ip`+`_parse_cidrs`+`_matches_cidr` / `_assert_downloadable_url`（字面量/DNS mock/白名单/总开关/协议拒绝）/ `_download_image` 拒绝降级 / `_fetch_url` 重定向逐跳过闸（本地 302 服务器实证）/ caption 清洗+空丢弃（端到端）/ PNG 超限回退。**180 passed + 4 skipped**（172 + 8，零回归；`test_local_command_ocr_prefers_inbound_image_url` 因 SSRF 闸拦 loopback 改 `allow_private_hosts=True`——其主题是 URL 优先级）。
 
 新配置键：`outbound_image_max_bytes`（默认 8388608）、`allow_cidrs`（[]）、`allow_private_hosts`（false）。版本 1.5.1 → 1.6.0。
+
+## 22. P1 批次回移：卡片转文字 / 表情包占位 / clarify 钩子 / 入站频控（2026-11-07，v1.7.0）
+
+接用户指示「P1/P2 参考宿主已有实现，不要重复做」——先对照 hermes-agent
+宿主源码重盘差距（见 §21 后的调研），P2 大件大幅缩水/撤销后执行本批。
+
+### 宿主对照结论（决定本批形状）
+
+- **宿主有原生 `clarify` 工具**（tools/clarify_gateway + 平台钩子
+  `send_clarify`/`retire_clarify_card` + inbound text-intercept 自动捕获
+  回复）→ dsh ask-tool.ts 的从零桥不搬，只做 QQ 呈现层（#13 缩水）。
+- **宿主没有 plan mode**（exit_plan_mode 是 dsh 宿主概念）→ dsh card-relay
+  的计划卡部分整体撤销；提问卡被 clarify 覆盖。
+- **宿主原生命令集**（/new /reset /stop /steer /queue /retry /approve
+  /deny 等）经「其余斜杠流转网关核心」在 QQ 可用 → 命令扩充撤销，转为验证。
+- 验证发现**真 bug**：宿主 exec-approval 让用户回复 `/approve
+  [session|always|<id>]`，而插件把带参 `/approve` 拦为 QQ 好友/群申请审批
+  → 未命中台账时报错吞掉，宿主审批在 QQ 上永远无法批准。修复：未命中
+  QQ 申请台账 → 返回 None 透传网关（裸 /approve 此前已透传）；群聊命中
+  台账仍提示去私聊（台账内容不进群），未命中在群里同样透传。
+
+### 落点
+
+| # | 项 | 落点 |
+|---|---|---|
+| #6 | QQ 卡片（json/xml 段）→ `[卡片:字段 · 链接]`（meta 首对象文本字段→内层→prompt→desc；xml brief/title/summary + url= 属性/`<url>` 标签；字段安全化：[]/<> 转全角、控制/格式字符剥离、长度截断；链接线性扫描防恶意输入）| onebot_utils `card_from_json`/`card_from_xml`/`_card_plain`/`_card_text` + adapter 双解析路径（CQ `_CQ_JSON_RE`/`_CQ_XML_RE` 加属性捕获组；段数组 json/xml 分支） |
+| #7 | 表情包占位：sub_type=1 图片与 mface 段占自己的位置——下载成功 `[表情包:<本地路径>]`、失败 `[表情包]`，不再冒充 [图片]；mface 此前整个被忽略 | onebot_utils `_CQ_MFACE_RE` + adapter CQ 路径（`_CQ_IMAGE_ALL_RE` 统一 sub + span→标签映射）与段数组路径 |
+| #13 | 宿主 clarify 的 QQ 呈现：`send_clarify` override（继承 base 默认渲染 + 记录 clarify_id→(chat_id, message_id)）；`retire_clarify_card`（撤回原提问气泡 + notice 转普通消息） | adapter |
+| #10 | 入站 per-chat 频控：`rate_limit_per_minute`（默认 30，0 关闭），60s 滑动窗口；斜杠命令不计入不受限；超限丢弃 + 每窗口至多一条提示（⏳ 文案）；提示任务持引用防 GC | adapter `_rate_limited`/`_send_rate_notice` + `_process_message` 挂载（admin 本地命令之后、内容构建之前） |
+| #17 | 见上——/approve 透传修复 + 验证宿主命令 fall-through 语义 | `_handle_request_decision`（None=未命中台账透传）、`_handle_local_command` approve 分支重构 |
+
+### 测试（新增 7 + 重钉 1，全绿）
+
+卡片 json/xml 可读性、恶意字段安全化、段数组 sticker/mface/card、CQ 路径
+sticker、频控窗口/提示/0 关闭、clarify 记录+撤回+通知、群聊 approve 台账
+命中私聊提示 vs 未命中透传；`test_approve_unknown_ref_errors` 重钉为
+`test_approve_unknown_ref_passthrough_gateway`（新语义）。**187 passed +
+4 skipped**（180 + 7，零回归）。
+
+新配置键：`rate_limit_per_minute`（默认 30）。版本 1.6.0 → 1.7.0。
+
+### 仍未做（后续裁决）
+
+- #8 `<user_message>` 边界包装+回显剥离（提示注入防御，中）
+- #9 主动写频控闸 actionRatePerMinute/Day（中）
+- #12 qq_send_segments 完整版 intervalMs+开关（小）
+- #15 超时补发 deferred（大，宿主确无对应机制）
+- #18 设置页：先调研 hermes dashboard 是否按插件 config_schema 自动渲染配置页
