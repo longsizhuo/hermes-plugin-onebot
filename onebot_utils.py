@@ -182,6 +182,58 @@ def card_from_xml(raw: Any) -> str:
     return _card_text(fields, [attr("url"), tag("url")])
 
 
+# ── <user_message> 提示注入边界（回移 dsh M3-D5 / T9）──────────────────
+def sanitize_nickname(nickname: str) -> str:
+    """昵称白名单净化：剥 C0/C1/DEL 与 XML 五字符 → 空白折叠 → 32 码点截断。
+
+    保证昵称在消息前缀与 <user_message> 边界属性两个落点都不可伪造
+    （换行不能造前缀行/边界、五个 XML 字符不能闭合/拆分/逃逸属性）。
+    """
+    printable = re.sub(r"[\x00-\x1f\x7f-\x9f<>&\"']", "", nickname or "")
+    collapsed = re.sub(r"\s+", " ", printable).strip()
+    return collapsed if len(collapsed) <= 32 else collapsed[:32]
+
+
+def wrap_user_message(content: str, user_id: str, nickname: str) -> str:
+    """把发送方可控内容（正文+引用展开）包进 <user_message> 边界。
+
+    开标签是可信来源标注：qq 属性是协议层 user_id（数字，非发送方文本）；
+    nickname 再次净化，边界对忘了先净化的调用方也保持不可闭合。
+    """
+    return (
+        f'<user_message qq="{user_id}" nickname="{sanitize_nickname(nickname)}">\n'
+        f"{content}\n</user_message>"
+    )
+
+
+_BOUNDARY_TRAILER_RE = re.compile(
+    r"^([\s\S]*\S)\s*<user_message\s[^>]*>[\s\S]*<\/user_message\s*>\s*\Z", re.I
+)
+_BOUNDARY_PAIR_RE = re.compile(r"<user_message\s[^>]*?>([\s\S]*?)<\/user_message\s*>", re.I)
+_BOUNDARY_STRAY_RE = re.compile(r"<\/?user_message(?:\s[^>]*?)?\/?>", re.I)
+
+
+def strip_boundary_leakage(text: str) -> str:
+    """剥离模型复述的 <user_message> 边界（回移 dsh T9/#26）。
+
+    尾部整块回显（含包裹内容）按泄漏整块删除（贪婪前缀一次只吃最后一个
+    回显包裹，循环吃连续回显）；中段成对包裹保留内容（有意引用）；游离
+    标签去掉；收尾折叠 3+ 连续空行。
+    """
+    if not text or not _BOUNDARY_STRAY_RE.search(text):
+        return text
+    cleaned = text
+    while True:
+        previous = cleaned
+        cleaned = _BOUNDARY_TRAILER_RE.sub(r"\1", previous)
+        if cleaned == previous:
+            break
+    cleaned = _BOUNDARY_PAIR_RE.sub(lambda m: m.group(1).strip(), cleaned)
+    cleaned = _BOUNDARY_STRAY_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _cq_file_text(m: "re.Match") -> str:
     """把 [CQ:file,...] 转为 '[文件:文件名]'（name 优先，无 name 取 file= 值）。"""
     attrs = {}

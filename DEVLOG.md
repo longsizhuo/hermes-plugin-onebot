@@ -716,3 +716,29 @@ sticker、频控窗口/提示/0 关闭、clarify 记录+撤回+通知、群聊 a
 - #12 qq_send_segments 完整版 intervalMs+开关（小）
 - #15 超时补发 deferred（大，宿主确无对应机制）
 - #18 设置页：先调研 hermes dashboard 是否按插件 config_schema 自动渲染配置页
+
+## 23. 收尾批次：user_message 边界 / 主动写闸 / segments T14（2026-11-07，v1.8.0）
+
+剩余项按用户指示「对照宿主已有实现，不要重复做」逐项处置：#8/#9/#12 实现，
+#15/#18 调研后搁置（宿主已有对应机制 / 无目标 UI）。
+
+### 落点
+
+| # | 项 | 说明 |
+|---|---|---|
+| #8 | `<user_message>` 提示注入边界 | onebot_utils：`sanitize_nickname`（C0/C1/DEL+XML 五字符剥除→空白折叠→32 码点）、`wrap_user_message`（qq 属性为协议层数字 id、nickname 再净化保证边界不可闭合）、`strip_boundary_leakage`（尾部整块回显删除（贪婪前缀循环吃连续回显）/中段成对保留内容/游离标签剥离，dsh T9/#26 正则逐条移植）。adapter：入站 reorder——引用展开→wrap（网关命令保持裸文本、纯媒体不包）→受限标记在边界外；出站 send() 在 strip_markdown 前剥回显；platform_hint 补边界声明与「长回复自动转卡片，勿自行分段」 |
+| #9 | 主动写频控闸 | W2-③：`action_rate_per_minute`（20）/`action_rate_per_day`（500），60s 滑动窗+自然日计数（本地时钟）；挂在 `/api/send_media`（qq_* 工具全 kind 面），拒绝 429 不占额度；审计 `media/qq-actions.log` JSONL（asyncio.Lock 保序，allowed/拒绝都记）；`GET /api/write_gate_stats` 用量快照（T11 同款鉴权） |
+| #12 | segments T14 完整版 | `segments_enabled`（false=工具不注册+端点拒绝）、`segments_interval_ms`（0–3000 默认 0）+ 工具 `intervalMs` 按次覆盖（超界截断）；段间 sleep 走可注入 `adapter._sleep` |
+| #15 | 超时补发 deferred → **搁置** | 宿主 delivery_ledger 已拥有发送失败重投（pending 素发/attempting 带恢复标记/flood_control 由 ledger 等待重投，#91969），且回合完成即投递无超时丢弃面——dsh deferred 的两个职责（回合超时登记补发+发送失败重试）宿主均已覆盖，不重复造 |
+| #18 | 设置页 → **搁置** | webapp dashboard 已弃用（用户确认）；dsh settings-remote 绑定 dsh 宿主专属的 Typert Remote + api-gateway + 设置页 client（cordis.patch.yml 声明），hermes 无对应挂载面。插件配置维持在 config.yaml `extra` 块；待宿主出现新配置 UI 再评估 |
+
+### 测试（新增 6 + 重钉 2，全绿）
+
+wrap/净化、strip 三种模式、入站 wrap+命令裸文本+受限标记在边界外、写闸
+分钟/日/拒绝不占额度/关闭、端点 429+审计 JSONL、segments interval 按次
+覆盖+禁用态；`test_reverse_ws_round_trip` 两处断言重钉（事件文本现在是
+边界包裹形态）、`/ver` v1.8.0。**193 passed + 4 skipped**（187 + 6，零回归）。
+
+新配置键：`action_rate_per_minute`/`action_rate_per_day`/`segments_enabled`/
+`segments_interval_ms`。版本 1.7.0 → 1.8.0。**dsh-onebot 差距清单至此清零**
+（全部回移完成或判定宿主已有/无目标面）。

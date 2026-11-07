@@ -105,6 +105,24 @@ def _access_token() -> str:
     return ""
 
 
+def _segments_enabled() -> bool:
+    """qq_send_segments 插件页开关（extra.segments_enabled，默认开）。
+
+    读 gateway 配置失败按开启处理（与 _access_token 同款降级：工具层
+    永远 importable，最终以适配器端点的同名校验兜底）。
+    """
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        pcfg = load_gateway_config().platforms.get(Platform("onebot"))
+        if pcfg is not None:
+            extra = getattr(pcfg, "extra", {}) or {}
+            return bool(extra.get("segments_enabled", True))
+    except Exception as e:  # noqa: BLE001 - tools must degrade to enabled
+        logger.debug("[onebot-tools] segments_enabled lookup skipped: %s", e)
+    return True
+
+
 def _http(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = _BASE + path
     data = None
@@ -233,11 +251,19 @@ def qq_send_segments(args: Dict[str, Any], **kw) -> str:
     if any(len(s) > 500 for s in segments):
         return "qq_send_segments: each segment is at most 500 chars / 每段最多 500 字"
     chat_id = _resolve_chat(args.get("chat_id"))
-    resp = _http(
-        "POST",
-        "/api/send_media",
-        {"chat_id": chat_id, "kind": "segments", "segments": segments, "session_chat": _session_chat()},
-    )
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "kind": "segments",
+        "segments": segments,
+        "session_chat": _session_chat(),
+    }
+    # T14：按次 intervalMs 覆盖（0–3000，超界按边界截断；省略用全局配置）
+    if args.get("intervalMs") is not None:
+        try:
+            payload["interval_ms"] = max(0, min(int(args["intervalMs"]), 3000))
+        except (TypeError, ValueError):
+            pass
+    resp = _http("POST", "/api/send_media", payload)
     return _media_result(resp)
 
 
@@ -365,6 +391,10 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
                     "items": {"type": "string"},
                     "description": "Ordered text bubbles, one send_msg each; 1-9 segments, each <=500 chars and non-empty. Split the text yourself — nothing is split automatically (分段文本列表，按顺序逐条发送；最多 9 段、每段 <=500 字，需自行拆好)",
                 },
+                "intervalMs": {
+                    "type": "integer",
+                    "description": "Optional per-call gap between adjacent bubbles in ms (0-3000, clamped); omitted = plugin config segments_interval_ms, default 0 (相邻段发送间隔，按次覆盖全局配置)",
+                },
                 "chat_id": chat_id,
             },
             "required": ["segments"],
@@ -406,8 +436,15 @@ _DESCRIPTIONS = {
 
 
 def register_tools(ctx) -> None:
-    """Register the qq_* tools in the ``qq`` toolset."""
+    """Register the qq_* tools in the ``qq`` toolset.
+
+    T14：segments_enabled=false 时 qq_send_segments 不注册（模型不可见即
+    不可用）；端点侧同名拒绝兜底（v1.8.0）。
+    """
     for name, schema in _schemas().items():
+        if name == "qq_send_segments" and not _segments_enabled():
+            logger.info("[onebot-tools] qq_send_segments disabled by config, skipping registration")
+            continue
         ctx.register_tool(
             name=name,
             toolset="qq",
