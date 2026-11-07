@@ -112,7 +112,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.8.1"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/

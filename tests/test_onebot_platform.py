@@ -2601,7 +2601,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.8.0" in t for t in texts)
+    assert any("onebot-plugin v1.8.1" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
