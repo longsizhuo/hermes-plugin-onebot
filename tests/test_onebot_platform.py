@@ -2601,7 +2601,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.8.1" in t for t in texts)
+    assert any("onebot-plugin v1.9.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -5112,3 +5112,147 @@ def test_snowluma_bot_status_and_offline_notices_silently_ignored() -> None:
         sent = asyncio.run(_dispatch_notice_and_collect(adapter, data))
         assert sent == []
     assert handled == []
+
+
+# ---------------------------------------------------------------------------
+# v1.9.0 批次：dashboard 设置页（#18 重启）——plugin_api 白名单/脱敏/守卫
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _dashboard_client(monkeypatch, tmp_path):
+    """plugin_api router 的 TestClient：HERMES_HOME 重定向 + extra 预置。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "platforms": {
+                "onebot": {
+                    "enabled": True,
+                    "extra": {
+                        "mode": "reverse", "host": "127.0.0.1", "port": 8643,
+                        "access_token": "s3cret-token", "text_image_threshold": 150,
+                        "require_mention": True, "allow_from": ["10001"],
+                        "segments_enabled": True, "segments_interval_ms": 0,
+                    },
+                }
+            }
+        },
+    )
+    saved: dict = {}
+
+    def fake_save(cfg):
+        saved.update(json.loads(json.dumps(cfg)))
+
+    monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    yield TestClient(app), saved, plugin_api
+
+
+def test_dashboard_config_redacts_token_and_whitelists(_dashboard_client) -> None:
+    """GET /config：凭证脱敏（has_access_token 布尔，不回显）；只出白名单键。"""
+    client, _, _ = _dashboard_client
+    res = client.get("/config")
+    assert res.status_code == 200
+    cfg = res.json()["config"]
+    assert cfg["has_access_token"] is True
+    assert "access_token" not in cfg
+    assert cfg["text_image_threshold"] == 150
+    assert cfg["allow_from"] == ["10001"]
+    assert "unknown_key_never_leaks" not in json.dumps(cfg)
+
+
+def test_dashboard_config_put_validates_and_saves(_dashboard_client) -> None:
+    """PUT /config：白名单/枚举/类型校验；合法写落到 save_config；要求重启。"""
+    client, saved, _ = _dashboard_client
+    ok = client.put("/config", json={"values": {
+        "mode": "forward", "port": "9000",  # 数字以字符串来也能收敛
+        "text_image_threshold": 200, "allow_private_hosts": False,
+        "allow_from": ["10001", "10002"],
+    }})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["restart_required"] is True
+    extra = saved["platforms"]["onebot"]["extra"]
+    assert extra["mode"] == "forward" and extra["port"] == 9000
+    assert extra["text_image_threshold"] == 200
+    assert extra["allow_private_hosts"] is False
+    assert extra["allow_from"] == ["10001", "10002"]
+    # access_token 未提交 → 原值保留
+    assert extra["access_token"] == "s3cret-token"
+
+    # 未知键 400
+    res = client.put("/config", json={"values": {"evil_key": 1}})
+    assert res.status_code == 400 and "evil_key" in res.json()["detail"]
+    # 枚举越界 400
+    res = client.put("/config", json={"values": {"mode": "sideways"}})
+    assert res.status_code == 400 and "mode" in res.json()["detail"]
+    # 非整数 400
+    res = client.put("/config", json={"values": {"port": "abc"}})
+    assert res.status_code == 400 and "port" in res.json()["detail"]
+
+
+def test_dashboard_config_token_write_roundtrip(_dashboard_client) -> None:
+    """access_token 只写不读：提交新值落盘，GET 仍只回 has_token。"""
+    client, saved, _ = _dashboard_client
+    res = client.put("/config", json={"values": {"access_token": "new-token"}})
+    assert res.status_code == 200
+    assert res.json()["config"]["has_access_token"] is True
+    assert "access_token" not in res.json()["config"]
+    assert "new-token" not in json.dumps(res.json())
+    assert saved["platforms"]["onebot"]["extra"]["access_token"] == "new-token"
+
+
+def test_dashboard_status_uses_live_adapter(monkeypatch) -> None:
+    """GET /status 同进程直取活 adapter：连接态 + 写闸用量，零网络。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(plugin_api._adapter_mod, "_live_adapter", lambda: adapter)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    client = TestClient(app)
+
+    adapter._ws = None
+    body = client.get("/status").json()
+    assert body["running"] is True and body["connected"] is False
+    assert body["write_gate"]["minute_limit"] == 20  # 默认闸
+    adapter._ws = object()
+    body = client.get("/status").json()
+    assert body["connected"] is True
+
+
+def test_dashboard_no_live_adapter_reports_not_running(monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setattr(plugin_api._adapter_mod, "_live_adapter", lambda: None)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    body = TestClient(app).get("/status").json()
+    assert body == {"status": "ok", "running": False}
+
+
+def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:
+    """守卫（对齐宿主 auth contract 测试）：前端 bundle 不读 session token
+    全局、必须走 SDK.fetchJSON、按 manifest name 调 register。"""
+    bundle = (Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
+    assert "__HERMES_SESSION_TOKEN__" not in bundle, "禁止直接读 token（SDK.fetchJSON 是唯一鉴权面）"
+    assert "SDK.fetchJSON" in bundle or "fetchJSON(" in bundle
+    assert 'register("onebot-platform"' in bundle
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[1] / "dashboard" / "manifest.json").read_text()
+    )
+    assert manifest["name"] == "onebot-platform"
+    assert manifest["entry"] == "dist/index.js" and manifest["api"] == "plugin_api.py"

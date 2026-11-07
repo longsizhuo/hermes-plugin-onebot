@@ -49,6 +49,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -112,7 +113,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.8.1"
+PLUGIN_VERSION = "1.9.0"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
@@ -3624,7 +3625,25 @@ def validate_config(config) -> bool:
 
 
 def _build_adapter(config):
-    return OneBotAdapter(config)
+    adapter = OneBotAdapter(config)
+    # 模块级活实例引用（弱引用防生命周期延长）：dashboard 插件 API
+    # （dashboard/plugin_api.py，同进程）经 _live_adapter() 读连接态与
+    # 写闸用量，不发网络请求。
+    _LIVE_ADAPTERS.append(weakref.ref(adapter))
+    return adapter
+
+
+_LIVE_ADAPTERS: "List[weakref.ref]" = []
+
+
+def _live_adapter() -> Optional[OneBotAdapter]:
+    """最近创建且仍存活的 adapter 实例；无则 None。"""
+    for ref in reversed(_LIVE_ADAPTERS):
+        adapter = ref()
+        if adapter is not None:
+            return adapter
+    _LIVE_ADAPTERS[:] = [r for r in _LIVE_ADAPTERS if r() is not None]
+    return None
 
 
 def _is_connected(config) -> bool:

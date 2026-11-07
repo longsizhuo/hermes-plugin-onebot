@@ -1,0 +1,13 @@
+{
+  "name": "onebot-platform",
+  "label": "QQ (OneBot)",
+  "description": "QQ bot via OneBot 11 — connection status, write-gate usage, audit trail and platform settings.",
+  "icon": "MessageCircle",
+  "version": "1.9.0",
+  "tab": {
+    "path": "/onebot",
+    "position": "after:plugins"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

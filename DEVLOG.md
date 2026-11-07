@@ -759,3 +759,49 @@ enabled=false 的「工具下线」语义保留（discovery 期跳过注册）�
 
 教训：工具注册路径（discovery/deadline 上下文）里禁止完整配置加载——只读
 配置用 load_config_readonly。
+
+## 24. Dashboard 设置页（#18 重启）（2026-11-08，v1.9.0）
+
+调研修正：v1.8.0 搁置 #18 的前提（「webapp dashboard 已弃用」）被推翻——
+用户澄清弃用的是早期独立的 `hermes dashboard` 服务模式；现役机制是网关
+webapp listener（`gateway/webapp_listener.py`，config `webapp.enabled`，
+默认 9120，"its dashboard mount serves the Webapp bundle"），且宿主有
+完整的插件 UI 扩展合同（kanban/achievements 先例）。设置页完全落在宿主
+已有扩展面内，零宿主改动。
+
+### 宿主扩展面（调研结论，2026-11-07/08）
+
+- `dashboard/` 三件套：`manifest.json`（tab/entry/api）+ `plugin_api.py`
+  （FastAPI APIRouter → 自动挂 `/api/plugins/<name>/`，auth 中间件 +
+  运行时 disabled 门）+ `dist/index.js`（免构建 IIFE）
+- 前端 SDK `window.__HERMES_PLUGIN_SDK__`：React/hooks、shadcn 原语
+  （Card/Badge/Button/Input/Label/Select/Checkbox/ConfirmDialog/Tabs…）、
+  `fetchJSON`/`authedFetch`（唯一合法鉴权面，宿主 auth-contract 测试强制）、
+  `utils.cn`
+- 后端注册：`window.__HERMES_PLUGINS__.register(manifest.name, Component)`
+- 写路径正典：`hermes_cli.config` 的 `load_config_readonly`/`save_config`
+  （POST /api/model/set 同款）；缺口＝无通用插件 extra 读写端点/自动表单
+  渲染器（memory provider 表单是专用先例）→ 插件自建白名单端点
+
+### 落点
+
+| 文件 | 内容 |
+|---|---|
+| dashboard/manifest.json | tab `/onebot`（after:plugins）+ entry + api |
+| dashboard/plugin_api.py | GET /config（白名单投影 + 凭证脱敏 has_access_token）；PUT /config（白名单/枚举/类型校验 → save_config，restart_required=true）；GET /status（`adapter._live_adapter()` 同进程直取：连接态 + 写闸用量，零网络）；GET /audit（media/qq-actions.log 尾部） |
+| dashboard/dist/index.js | SDK IIFE：状态面板 + 五组表单（连接/策略/发送与频控/segments/高级）+ 保存横幅（重启生效）+ 审计查看；access_token 只写不读 |
+| adapter.py | `_build_adapter` 记弱引用 `_LIVE_ADAPTERS` + `_live_adapter()`（同进程取活实例） |
+
+extra 白名单：str/int/bool/list 四类 24 键 + access_token（只写）。全部在
+adapter.__init__ 读取 → PUT 返回 restart_required，前端横幅提示重启。
+
+### 测试（新增 6，全绿）
+
+config 脱敏/白名单、PUT 校验（未知键/枚举/非整数 400）+ save_config 落盘、
+token 只写不读 roundtrip、status 活实例直取（连接态+写闸默认值）、
+无实例 not running、前端守卫（不读 `__HERMES_SESSION_TOKEN__`、走
+fetchJSON、register 名匹配 manifest）。**199 passed + 4 skipped**
+（193 + 6，零回归；测试 venv 补 fastapi/httpx）。
+
+版本 1.8.1 → 1.9.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
+manifest 四处同步）。
