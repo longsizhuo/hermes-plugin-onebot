@@ -39,7 +39,7 @@ NapCat (QQ)  ←— 反向 WS —→  OneBotAdapter (adapter.py)  ←— Hermes 
 | 连接生命周期 | `connect/disconnect`、`_start_reverse_server`、`_connect_forward_once`、`_forward_read_loop`、`_forward_reconnect` | 反向 WS 服务 + 可选正向 WS 连接 + 自动重连 |
 | 入站 | `_handle_frame`、`_process_message`、`_parse_content`、`_parse_message_array` | 段数组优先解析（回退 CQ 字符串），CQ 反转义，图片/语音/视频/引用处理 |
 | 媒体入站 | `_resolve_image`、`_download_image`、`_download_media`、`_download_audio`、`_shrink_image` | url/base64/file/hash 四路取图；图片压缩 ≤2048px；语音下载转 WAV |
-| 出站 | `send`、`_send_media`、`send_image(_file)`、`send_multiple_images`、`send_voice`、`send_video`、`send_document` | 分段、t2i 转图、批量图 ≤9 张、媒体 base64 |
+| 出站 | `send`、`_send_media`、`send_image(_file)`、`send_multiple_images`、`send_voice`、`send_video`、`send_document` | 两档发送（不分段）、t2i 转图、批量图 ≤9 张、媒体 base64 |
 | 扩展 API | `send_typing/stop_typing`（NapCat set_input_status）、`_handle_group_history`（HTTP /api/group_history）、`send_forward_msg`（[[qq_forward]]） | |
 | 回复周期合并 | `_settle_loop_buffer` | loop 中间消息 → 合并转发 + 撤回（见 §5.7） |
 | 引用取图 | `_process_message` 内 get_msg 分支 | 引用消息自动取原文文本 + 图片（见 §5.6） |
@@ -50,8 +50,8 @@ NapCat (QQ)  ←— 反向 WS —→  OneBotAdapter (adapter.py)  ←— Hermes 
 | 函数 | 职责 |
 |---|---|
 | `_cq_unescape` | CQ 反转义（&amp; → &、&#91; → [、&#93; → ]、&#44; → ,） |
-| `_split_reply` / `DEFAULT_SPLIT_LENGTH` / `_SENTENCE_BOUNDS` | 长消息按标点分段（≤100 单条、100–150 分段、>150 转图） |
-| `strip_markdown` / `_inline_markdown` | QQ 不渲染 Markdown，发前剥离（保留 `[[qq_forward]]` 等内部标记） |
+| ~~`_split_reply` / `DEFAULT_SPLIT_LENGTH` / `_SENTENCE_BOUNDS`~~ | **v1.5.0 已删除**（方案 B 拆除分段，见 §14） |
+| `strip_markdown` / `_inline_markdown` | QQ 不渲染 Markdown，发前剥离（保留 `[[qq_forward]]` 等内部标记；v1.5.0 起强调规则带回移 dsh PR #32 + f809d27 词边界） |
 | `_FACE_EMOJI` | QQ 表情 id → emoji 映射表 |
 | `_ttc_sc_index` / `_build_font_chain` | Noto CJK ttc 简体索引 + 字体回退链 |
 | `_build_chat_id` / `_split_chat_id` | chat_id 编解码（private:123456789 / group:123456789） |
@@ -515,3 +515,100 @@ onebot 插件自 hermes-agent fork 插件线（feat/onebot-platform-v0.22.2，�
 ### 测试
 
 `cd tests && HERMES_AGENT_HOME=<hermes-agent> pytest test_onebot_platform.py -q`：**167 passed**（基线 165 + 新增 2，0 failed）。
+
+---
+
+## 18. 方案 B 回移：拆除出站自动分段 + 强调词边界（2026-11-07，v1.5.0）
+
+接手后的第一项任务：回移 dsh-onebot 的「防止文本被异常分段」实现。dsh 侧
+DEVLOG §2026-09-14（splitLength 拆除，方案 B）+ PR #32 + f809d27。
+
+### 背景（dsh 侧踩过的坑）
+
+- 标点窗口里没有标点时 `_split_reply` 在 limit-1 处硬切，词中/URL 拦腰断
+  （「需要我做什/么直接说」）。
+- 101–150 字符（默认 splitLength=100、threshold=150）区间内容必被拆成 2 条，
+  中间消息逐字同文重复气泡（dsh §2026-09-14 排查定案）。
+- stripMarkdown 强调规则不看词边界，snake_case/路径/URL 被改坏（PR #32），
+  算式 `3*4*5` 被吃掉星号（f809d27）。
+
+### 改动
+
+1. **adapter.py send 出站两档化（方案 B）**：删除 `_split_reply` 调用与
+   `extra.split_length` 读取（旧配置静默忽略，与 dsh zod 非 strict 口径
+   一致）；正文 ≤ `text_image_threshold`（默认 150）单条发送，> 阈值渲染
+   t2i 卡片，卡片失败/超限回退**整段单条**纯文本（不再分段）；媒体段并入
+   唯一文本消息；`_buf_sent_ids` 每次至多 1 条。
+2. **onebot_utils.py**：删除 `_split_reply` / `DEFAULT_SPLIT_LENGTH` /
+   `_SENTENCE_BOUNDS`（留墓碑注释）；`_inline_markdown` 强调规则回移 dsh
+   词边界口径——星号系（`***`/`**`/`*`）边界不接 `[0-9A-Za-z*]`、内容不跨
+   行不跨星号；下划线系（`___`/`__`/`_`）边界不接 `\w`（含中文）、内容不
+   跨行不跨下划线（`_a_b_` 整体保留）。
+3. **PLUGIN_VERSION 1.3.0 → 1.5.0**（顺带修正 v1.4.0 只升 plugin.yaml 未升
+   PLUGIN_VERSION 的漂移；plugin.yaml 同步 1.5.0）。
+4. **文档**：README 中英双语出站行/配置表/长回复章节改两档口径，注明旧
+   `split_length` 静默忽略；plugin.yaml description 去掉「split at sentence
+   boundaries」；DEVLOG §2.1/§2.2 表同步。
+
+### 行为变化（用户可见）
+
+- 100–150 字区间的回复不再拆成两条气泡——单条直接发。
+- t2i 卡片渲染失败/超 8000px 时回退为**一整条**长文本（旧：拆成多条 100 字
+  气泡）。
+- 旧配置里的 `split_length` 键不再生效（静默忽略）。
+- 紧贴中文/字母/数字的下划线与星号不再被当强调剥掉：`报告_第一版_终稿.docx`、
+  `foo_bar_baz.py`、`3*4*5` 原样保留；`_italic_`、`**粗体**` 等真强调照常剥。
+  已知与 dsh 一致的残留：`__init__.py` 仍会变 `init.py`（CommonMark 也算强
+  调，不强求）；行首 `_cache` 与下一行行尾 `class_` 因不跨行不再配对（比
+  CommonMark 更保守，与 dsh 同口径）。
+
+### 测试
+
+- 删 4 条 `_split_reply` 用例；重写 3 条发送用例钉两档行为（160 字关卡片
+  路径恰 1 条消息、媒体并入单条、t2i 超限回退恰 1 条整段文本）；新增 3 条
+  `_inline_markdown` 词边界用例（真强调护栏 / snake_case+路径+URL+CJK /
+  星号算式）。
+- 基线对比：HEAD worktree **167 passed + 4 skipped** vs 改后 **166 passed +
+  4 skipped**（净 -1 = 删 4 增 3，零回归）。两轮均 `HERMES_AGENT_HOME=` 系统
+  hermes-agent（v0.23.0+209.g90d6b98）+ 独立 venv（pytest/pytest-asyncio/
+  websockets/pillow/fonttools/aiohttp/ruamel.yaml——系统 gateway 的 yaml 层
+  是 ruamel.yaml 而非 pyyaml）。
+
+## 19. qq_send_segments 回移（精简版）（2026-11-07，v1.5.0）
+
+补齐 §18 后与 dsh-onebot 仅剩的行为差距：dsh 在方案 B 拆除自动分段后，分条
+呈现的唯一手段是显式工具 `qq_send_segments`（T10/#6，0.9.10）。按用户裁决
+回移**精简版**（不做 T14 的 intervalMs 呼吸间隔与插件页开关）。
+
+### 口径（对齐 dsh）
+
+- 模型显式调用，自行拆好每段：**1–9 段、每段 ≤500 字、不能为空**（空段在
+  过滤后为空即报错，与 dsh `texts.length === 0` throw 一致）。
+- 出站同源清洗（dsh PR #25）：每段过 `strip_markdown`，清洗后为空的段按
+  既有丢弃语义直接不发送，丢弃时打 info 日志（grep `/api/send_media segments`）。
+- 发送：逐段独立 `send_msg`（顺序发送，无间隔——精简版不含呼吸感）；群聊
+  `group_id` / 私聊 `user_id`，`message_id` 返回最后一条。
+- 鉴权/越权：走 `/api/send_media` 既有 `_check_api_auth` +
+  `_authorize_cross_chat_send` 共用闸（无新增攻击面）。
+- 精简版明确不做：`intervalMs` 相邻段间隔、`segments.enabled` 插件页开关。
+
+### 落点
+
+| 文件 | 改动 |
+|---|---|
+| adapter.py | `_handle_send_media` 新增 `kind=segments` 分支（校验/清洗/丢弃日志/逐段发送） |
+| tools.py | `qq_send_segments` handler + schema + 英文优先描述 + `_HANDLERS` 注册 |
+| plugin.yaml | `provides_tools` 追加（CLI/TUI 预载） |
+| README 双语 | 工具行追加 `qq_send_segments` |
+
+### 测试（新增 3，全绿）
+
+- `test_tools_send_segments_builds_media_request`：工具层校验（空/全空白/
+  超 9/超 500）+ `/api/send_media` 请求形状。
+- `test_api_send_media_segments_e2e`：tools → 真实 API 服务 → adapter 桩
+  `_call_action`：3 段（含 `**清洗**` 与 `~~ ~~` 清洗后为空）→ 恰 2 条
+  `send_msg`、群目标、顺序与清洗结果正确。
+- `test_api_send_media_segments_validation`：端点层 5 类 400（非列表/空/
+  超 9/超 500/清洗后全空）。
+
+版本保持 v1.5.0（与 §18 同一批发布）。

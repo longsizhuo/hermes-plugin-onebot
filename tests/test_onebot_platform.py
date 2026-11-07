@@ -1,8 +1,9 @@
 """Tests for the OneBot 11 platform adapter (NapCat / Lagrange / LLOneBot).
 
-Covers reply splitting at sentence boundaries, CQ-code parsing, mention
-gating, DM/group policies, outbound segment-array payloads, text-image
-rendering, and a live reverse-WS round trip against a fake NapCat client.
+Covers outbound two-tier delivery (single text / t2i card, no auto
+splitting), CQ-code parsing, mention gating, DM/group policies, outbound
+segment-array payloads, text-image rendering, and a live reverse-WS
+round trip against a fake NapCat client.
 """
 
 import asyncio
@@ -29,46 +30,51 @@ from onebot_platform.adapter import (
     render_text_image,
 )
 from onebot_platform import t2i_render
-from onebot_platform.onebot_utils import (
-    DEFAULT_SPLIT_LENGTH,
-    _split_reply,
-)
+from onebot_platform.onebot_utils import _inline_markdown
 
 
 # ---------------------------------------------------------------------------
-# _split_reply
+# _inline_markdown 强调词边界（回移 dsh PR #32 + f809d27）
 # ---------------------------------------------------------------------------
 
 
-def test_split_reply_short_message_unchanged() -> None:
-    assert _split_reply("短消息。", 100) == ["短消息。"]
+def test_inline_markdown_real_emphasis_still_stripped() -> None:
+    """真强调护栏：边界合规的强调照常剥（两端都应通过）。"""
+    assert _inline_markdown("_italic_") == "italic"
+    assert _inline_markdown("__bold__") == "bold"
+    assert _inline_markdown("___粗斜体___") == "粗斜体"
+    assert _inline_markdown("**粗体** 和 *斜体*") == "粗体 和 斜体"
+    assert _inline_markdown("这是 _斜体_ 文字") == "这是 斜体 文字"
+    assert _inline_markdown("（_斜体_）") == "（斜体）"
+    assert _inline_markdown("（__粗体__）") == "（粗体）"
 
 
-def test_split_reply_breaks_at_sentence_boundaries() -> None:
-    text = "第一句完整的话。第二句完整的话！第三句问号？" * 8
-    parts = _split_reply(text, 100)
-    assert len(parts) > 1
-    for part in parts:
-        assert 0 < len(part) <= 100
-        # Every non-final chunk must end on a sentence boundary.
-        assert part[-1] in "。！？!?；;\n"
+def test_inline_markdown_snake_case_and_paths_preserved() -> None:
+    """PR #32 主修：下划线不再改坏 snake_case、路径、URL、常量名。"""
+    assert _inline_markdown("foo_bar_baz.py") == "foo_bar_baz.py"
+    assert _inline_markdown(
+        "https://example.com/a_b_c/d.png"
+    ) == "https://example.com/a_b_c/d.png"
+    assert _inline_markdown("C:\\work_dir\\sub_dir\\x.txt") == "C:\\work_dir\\sub_dir\\x.txt"
+    assert _inline_markdown("用 qq_send_image 发图") == "用 qq_send_image 发图"
+    assert _inline_markdown("SOME_CONST_NAME") == "SOME_CONST_NAME"
+    assert _inline_markdown("`foo_bar_baz.py`") == "foo_bar_baz.py"
+    # 紧贴中文的下划线不再是强调（CommonMark 口径），保持原样。
+    assert _inline_markdown("这是_斜体_文字") == "这是_斜体_文字"
+    assert _inline_markdown("这是__粗体__文字") == "这是__粗体__文字"
+    assert _inline_markdown("报告_第一版_终稿.docx") == "报告_第一版_终稿.docx"
+    # 内容含下划线的伪强调整体保留（旧规则会变成 ab_）。
+    assert _inline_markdown("_a_b_") == "_a_b_"
+    # 同行两处合法强调都剥（旧规则第二个剥不掉）。
+    assert _inline_markdown("_一_ _二_") == "一 二"
 
 
-def test_split_reply_hard_cut_without_boundaries() -> None:
-    text = "x" * 250
-    parts = _split_reply(text, 100)
-    assert [len(p) for p in parts] == [100, 100, 50]
-
-
-def test_split_reply_respects_explicit_newlines() -> None:
-    # Newlines are sentence boundaries: a >limit text full of newlines
-    # breaks at the newlines (each line is short).
-    text = ("行" * 30 + "\n") * 5  # 155 chars, newline every 31 chars
-    parts = _split_reply(text, 100)
-    assert len(parts) >= 2
-    for part in parts[:-1]:
-        assert part.endswith("\n")
-    assert all(len(p) <= 100 for p in parts)
+def test_inline_markdown_star_boundaries_preserved() -> None:
+    """f809d27 主修：星号不再改坏算式，真强调照常剥。"""
+    assert _inline_markdown("3*4*5=60") == "3*4*5=60"
+    assert _inline_markdown("2**3**2=32") == "2**3**2=32"
+    assert _inline_markdown("a ** b") == "a ** b"
+    assert _inline_markdown("**粗体** 和 *斜体* 和 `代码`") == "粗体 和 斜体 和 代码"
 
 
 # ---------------------------------------------------------------------------
@@ -397,20 +403,21 @@ def test_send_uses_segment_array_without_reply() -> None:
     assert all(seg["type"] != "reply" for seg in payload["params"]["message"])
 
 
-def test_send_splits_long_text_into_multiple_messages() -> None:
-    # Disable the text-image path so we exercise the chunking logic.
-    adapter = _make_adapter(split_length=50, text_image_threshold=0)
+def test_send_long_text_delivered_as_single_message() -> None:
+    # 方案 B（dsh b19fa5e 回移）：正文不再按标点分段——卡片路径关闭时，
+    # 超阈值内容也整段单条发送，杜绝词中/URL 被拦腰切断。
+    adapter = _make_adapter(text_image_threshold=0)
     ws = _FakeWS(adapter)
     adapter._ws = ws
     long_text = "第一句。第二句。" * 20  # 160 chars, sentence boundaries
     result = asyncio.run(adapter.send("group:888888", long_text))
     assert result.success
-    assert len(ws.sent) > 1
-    for payload in ws.sent:
-        assert payload["params"]["group_id"] == 888888
-        segs = payload["params"]["message"]
-        assert segs and segs[0]["type"] == "text"
-        assert len(segs[0]["data"]["text"]) <= 50
+    assert len(ws.sent) == 1
+    payload = ws.sent[0]
+    assert payload["params"]["group_id"] == 888888
+    segs = payload["params"]["message"]
+    assert segs and segs[0]["type"] == "text"
+    assert segs[0]["data"]["text"] == long_text
 
 
 def test_send_long_content_uses_text_image(monkeypatch) -> None:
@@ -432,9 +439,10 @@ def test_send_long_content_uses_text_image(monkeypatch) -> None:
     assert segs[0]["data"]["file"].startswith("base64://")
 
 
-def test_send_attaches_media_to_final_chunk() -> None:
-    # 80 chars: >50 (splits) but <150 (no text image).
-    adapter = _make_adapter(split_length=50)
+def test_send_attaches_media_to_text_message() -> None:
+    # 方案 B 后正文只有一条：媒体段直接并到这条消息（旧口径是挂在
+    # 末段文本块上）。
+    adapter = _make_adapter(text_image_threshold=0)
     ws = _FakeWS(adapter)
     adapter._ws = ws
     long_text = "第一句。第二句。" * 10
@@ -447,9 +455,11 @@ def test_send_attaches_media_to_final_chunk() -> None:
     )
     # Missing local file is skipped gracefully; text still delivered.
     assert result.success
-    assert len(ws.sent) > 1
-    for payload in ws.sent:
-        assert all(seg["type"] == "text" for seg in payload["params"]["message"])
+    assert len(ws.sent) == 1
+    segs = ws.sent[0]["params"]["message"]
+    assert segs and segs[0]["type"] == "text"
+    assert segs[0]["data"]["text"] == long_text
+    assert all(seg["type"] == "text" for seg in segs)
 
 
 def test_send_fails_fast_when_disconnected() -> None:
@@ -1492,6 +1502,32 @@ def test_tools_send_image_builds_media_request(monkeypatch) -> None:
     assert "9" in too_many
 
 
+def test_tools_send_segments_builds_media_request(monkeypatch) -> None:
+    """qq_send_segments（回移 dsh T10 精简版）：工具层校验 + 请求形状。"""
+    from onebot_platform import tools
+
+    calls = []
+
+    def fake_http(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {"ok": True, "message_id": "m2"}
+
+    monkeypatch.setattr(tools, "_http", fake_http)
+    out = tools.qq_send_segments(
+        {"segments": ["第一段", "**第二段**"], "chat_id": "group:888888"}
+    )
+    assert "Sent" in out
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == "/api/send_media"
+    assert calls[0][2]["kind"] == "segments"
+    assert calls[0][2]["segments"] == ["第一段", "**第二段**"]
+    # 校验：空列表 / 全空白段 / 超 9 段 / 超 500 字
+    assert "不能为空" in tools.qq_send_segments({"segments": []})
+    assert "非空文本" in tools.qq_send_segments({"segments": ["   "]})
+    assert "9" in tools.qq_send_segments({"segments": [f"段{i}" for i in range(10)]})
+    assert "500" in tools.qq_send_segments({"segments": ["x" * 501]})
+
+
 def test_tools_napcat_api_whitelist_guard(monkeypatch) -> None:
     from onebot_platform import tools
 
@@ -1703,6 +1739,119 @@ def test_tools_e2e_token_against_api_gate(monkeypatch) -> None:
     assert set(calls) == {"get_group_msg_history"}
 
 
+def test_api_send_media_segments_e2e(monkeypatch) -> None:
+    """端到端：qq_send_segments → /api/send_media(segments) → 逐段 send_msg。
+
+    回移 dsh T10 精简版口径：1–9 段逐条独立气泡、出站同源 strip_markdown
+    清洗、清洗后为空的段按丢弃语义不发送（dsh PR #25）。
+    """
+    import concurrent.futures
+
+    from onebot_platform import tools
+
+    adapter = _make_adapter(access_token="s3cret-token")
+    calls: list = []
+
+    async def fake_call(action, params, timeout=15.0):
+        calls.append((action, params))
+        return {"message_id": len(calls)}
+
+    adapter._call_action = fake_call
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "s3cret-token")
+            monkeypatch.setattr(tools, "_BASE", f"http://127.0.0.1:{port}")
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                out = await loop.run_in_executor(
+                    pool,
+                    lambda: tools.qq_send_segments(
+                        {
+                            "segments": ["**第一段**", "~~ ~~", "第二段"],
+                            "chat_id": "group:888888",
+                        }
+                    ),
+                )
+        finally:
+            await runner.cleanup()
+        return out
+
+    out = asyncio.run(run())
+    assert "Sent" in out, f"应发送成功：{out}"
+    # 两条 send_msg（"~~ ~~" 清洗后为空被丢弃），都是群聊目标
+    assert [(a, p.get("group_id")) for a, p in calls] == [("send_msg", 888888)] * 2
+    texts = [p["message"][0]["data"]["text"] for _, p in calls]
+    assert texts == ["第一段", "第二段"]
+
+
+def test_api_send_media_segments_validation(monkeypatch) -> None:
+    """segments 端点层校验：非列表 / 为空 / 超 9 段 / 超 500 字 / 全空清洗 → 400。"""
+    import concurrent.futures
+    import urllib.error
+    import urllib.request
+
+    adapter = _make_adapter(access_token="s3cret-token")
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        base = f"http://127.0.0.1:{port}/api/send_media"
+
+        def post(payload):
+            req = urllib.request.Request(
+                base,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer s3cret-token",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        try:
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                cases = await asyncio.gather(
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": "not-a-list"},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": []},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": [f"段{i}" for i in range(10)]},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": ["x" * 501]},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": ["~~ ~~"]},
+                    ),
+                )
+        finally:
+            await runner.cleanup()
+        return cases
+
+    cases = asyncio.run(run())
+    assert [s for s, _ in cases] == [400, 400, 400, 400, 400]
+    assert "must be a list" in cases[0][1]["error"]
+    assert "empty" in cases[1][1]["error"]
+    assert "9" in cases[2][1]["error"]
+    assert "500" in cases[3][1]["error"]
+    assert "markdown strip" in cases[4][1]["error"]
+
+
 async def _start_api_server(adapter):
     """起一个只挂 onebot API 路由的本地服务，返回 (runner, port)。"""
     from aiohttp import web
@@ -1896,7 +2045,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.3.0" in t for t in texts)
+    assert any("onebot-plugin v1.5.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -2438,24 +2587,25 @@ def test_t2i_render_over_limit_raises() -> None:
         render_text_image("超限的行\n" * 400)
 
 
-def test_send_t2i_over_limit_falls_back_to_text_chunks(monkeypatch) -> None:
-    """超限走既有失败回退路径：渲染抛 ValueError → 降级分段纯文本发送，
-    不发送任何图片段。"""
+def test_send_t2i_over_limit_falls_back_to_single_text(monkeypatch) -> None:
+    """超限走既有失败回退路径：渲染抛 ValueError → 降级整段单条纯文本
+    发送（方案 B：不再分段），不发送任何图片段。"""
     from onebot_platform import adapter as adapter_mod
 
     def boom(text, title=None):
         raise ValueError("rendered height exceeds MAX_RENDER_HEIGHT=8000px")
 
     monkeypatch.setattr(adapter_mod, "render_text_image", boom)
-    adapter = _make_adapter(text_image_threshold=50, split_length=50)
+    adapter = _make_adapter(text_image_threshold=50)
     ws = _FakeWS(adapter)
     adapter._ws = ws
 
     result = asyncio.run(adapter.send("private:1", "很长" * 40))
     assert result.success
-    assert ws.sent, "fallback must still deliver text"
-    for payload in ws.sent:
-        assert all(seg["type"] == "text" for seg in payload["params"]["message"])
+    assert len(ws.sent) == 1, "fallback must deliver the whole text as one message"
+    segs = ws.sent[0]["params"]["message"]
+    assert all(seg["type"] == "text" for seg in segs)
+    assert segs[0]["data"]["text"] == "很长" * 40
 
 
 def test_reverse_server_startup_raises_hostname_without_token() -> None:

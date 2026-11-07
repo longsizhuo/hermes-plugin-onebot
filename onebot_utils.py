@@ -1,7 +1,7 @@
 """OneBot 纯逻辑工具模块（可热加载）。
 
-包含与协议状态无关的纯函数/常量：CQ 码解析、Markdown 剥离、长消息
-分段、表情映射、文字图字体链。adapter.py 通过 ``_load_onebot_utils()``
+包含与协议状态无关的纯函数/常量：CQ 码解析、Markdown 剥离、表情映射、
+文字图字体链。adapter.py 通过 ``_load_onebot_utils()``
 按 mtime 热加载本模块——改这里面的规则无需重启 gateway。
 """
 
@@ -60,9 +60,10 @@ def _cq_unescape(s: str) -> str:
     )
 
 
-# ── 长消息分段 ─────────────────────────────────────────────────────────
-DEFAULT_SPLIT_LENGTH = 100
-_SENTENCE_BOUNDS = "。！？!?；;\n"
+# ── 长消息分段（已拆除）───────────────────────────────────────────────
+# 方案 B（dsh b19fa5e 回移）：正文两档化（≤阈值单条 / >阈值 t2i 卡片，
+# 失败回退整段单条），_split_reply/DEFAULT_SPLIT_LENGTH/_SENTENCE_BOUNDS
+# 随之删除——防止文本在标点窗口外被拦腰切断、interim 拆成同文重复气泡。
 
 # ── NapCat API 白名单 ──────────────────────────────────────────────────
 # 权威定义在此；tools.py 经 fallback 导入本常量（生产网关以裸模块方式
@@ -87,40 +88,6 @@ NAPCAT_API_WHITELIST = [
 ]
 
 
-def _split_reply(content: str, limit: int = DEFAULT_SPLIT_LENGTH) -> List[str]:
-    """Split long content into ≤limit-char chunks at sentence boundaries.
-
-    Prefers the nearest sentence-ending punctuation inside the window;
-    falls back to a hard cut at the limit only when a chunk has no
-    boundary at all (keeps progress guaranteed).
-    """
-    if not content:
-        return []
-    if len(content) <= limit:
-        return [content]
-    parts: List[str] = []
-    start = 0
-    n = len(content)
-    while start < n:
-        end = min(start + limit, n)
-        if end >= n:
-            parts.append(content[start:])
-            break
-        window = content[start:end]
-        cut = -1
-        for i in range(len(window) - 1, -1, -1):
-            if window[i] in _SENTENCE_BOUNDS:
-                cut = i
-                break
-        if cut == -1:
-            # No sentence boundary in the window — hard cut to stay bounded.
-            cut = limit - 1
-        parts.append(content[start : start + cut + 1])
-        start = start + cut + 1
-    # Trim stray spaces but keep sentence-boundary newlines intact.
-    return [p.rstrip(" \t") for p in parts if p.strip(" \t")]
-
-
 # ── 表情映射 ───────────────────────────────────────────────────────────
 # A few common QQ faces → emoji; anything else collapses to [表情].
 _FACE_EMOJI = {
@@ -132,14 +99,23 @@ _FACE_EMOJI = {
 
 # ── Markdown 剥离（QQ 不渲染 Markdown）────────────────────────────────
 def _inline_markdown(text: str) -> str:
-    """Strip inline Markdown from a single line (QQ shows raw syntax)."""
+    """Strip inline Markdown from a single line (QQ shows raw syntax).
+
+    强调规则带回移自 dsh-onebot PR #32 + f809d27 的词边界口径：下划线
+    系（``___``/``__``/``_``）边界不接 Unicode 字母/数字/下划线、内容不
+    跨行不跨下划线；星号系（``***``/``**``/``*``）边界不接 ASCII 字母/
+    数字/星号。这样 snake_case、文件路径、URL、``3*4*5`` 不再被改坏，
+    真强调（``_italic_``、``**粗体**``）照常剥。
+    """
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
-    text = re.sub(r"\*{3}(.+?)\*{3}", r"\1", text)
-    text = re.sub(r"_{3}(.+?)_{3}", r"\1", text)
-    text = re.sub(r"\*{2}(.+?)\*{2}", r"\1", text)
-    text = re.sub(r"_{2}(.+?)_{2}", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # 星号系：边界不接 [0-9A-Za-z*]（f809d27）；内容不跨行不跨星号。
+    text = re.sub(r"(?<![0-9A-Za-z*])\*\*\*([^*\n]+?)\*\*\*(?![0-9A-Za-z*])", r"\1", text)
+    text = re.sub(r"(?<![0-9A-Za-z*])\*\*([^*\n]+?)\*\*(?![0-9A-Za-z*])", r"\1", text)
+    text = re.sub(r"(?<![0-9A-Za-z*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![0-9A-Za-z*])", r"\1", text)
+    # 下划线系：边界不接 \\w（字母/数字/下划线，含中文）（PR #32）。
+    text = re.sub(r"(?<!\w)___([^_\n]+?)___(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)__([^_\n]+?)__(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", text)
     text = re.sub(r"~~(.+?)~~", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", text)
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"[\1]", text)

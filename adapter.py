@@ -111,7 +111,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.5.0"
 
 # Max bytes for a downloaded voice clip (silk/amr from QQ).
 AUDIO_MAX_BYTES = 15 * 1024 * 1024
@@ -337,13 +337,9 @@ class OneBotAdapter(BasePlatformAdapter):
         self._url = str(extra.get("url", "ws://127.0.0.1:3001"))
         self._access_token = _standalone_access_token(extra)
         self._bot_qq = str(extra.get("bot_qq", "") or "").strip()
-        _default_split = _load_onebot_utils().DEFAULT_SPLIT_LENGTH
-        try:
-            self._split_length = int(extra.get("split_length", _default_split))
-        except (TypeError, ValueError):
-            self._split_length = _default_split
-        if self._split_length <= 0:
-            self._split_length = _default_split
+        # split_length 已随方案 B（dsh b19fa5e 回移）拆除：正文不再按标点
+        # 分段，旧配置里的 extra.split_length 被静默忽略（与 dsh zod 非
+        # strict 口径一致）。
         try:
             self._text_image_threshold = int(
                 extra.get("text_image_threshold", DEFAULT_TEXT_IMAGE_THRESHOLD)
@@ -725,6 +721,7 @@ class OneBotAdapter(BasePlatformAdapter):
           - kind=video:   {path}
           - kind=file:    {path, file_name?}
           - kind=forward: {nodes: [{name, content}]}
+          - kind=segments: {segments: [text, ...]}  (qq_send_segments, 1-9 x <=500)
         Auth: shared `_check_api_auth` gate — this endpoint forwards local
         files into a chat, so without valid credentials it never reaches a
         send (401); loopback-only when no token is configured.
@@ -737,7 +734,7 @@ class OneBotAdapter(BasePlatformAdapter):
             return web.json_response({"status": "error", "error": "bad json"}, status=400)
         chat_id = str(payload.get("chat_id") or "")
         kind = str(payload.get("kind") or "")
-        if not chat_id or kind not in ("image", "voice", "video", "file", "forward"):
+        if not chat_id or kind not in ("image", "voice", "video", "file", "forward", "segments"):
             return web.json_response(
                 {"status": "error", "error": "chat_id and kind (image/voice/video/file/forward) required"},
                 status=400,
@@ -808,6 +805,56 @@ class OneBotAdapter(BasePlatformAdapter):
                 message_id = getattr(res, "message_id", None)
                 if not getattr(res, "success", False):
                     return web.json_response({"status": "error", "error": res.error or "send failed"})
+            elif kind == "segments":
+                # 回移 dsh T10/#6（qq_send_segments）：显式多气泡发送——
+                # 自动分段已随方案 B 拆除，模型想分条呈现时自行拆好每段。
+                segs_raw = payload.get("segments") or []
+                if not isinstance(segs_raw, list):
+                    return web.json_response(
+                        {"status": "error", "error": "segments must be a list"}, status=400
+                    )
+                segs = [s for s in segs_raw if isinstance(s, str) and s.strip()]
+                if not segs:
+                    return web.json_response(
+                        {"status": "error", "error": "segments empty"}, status=400
+                    )
+                if len(segs) > 9:
+                    return web.json_response(
+                        {"status": "error", "error": "at most 9 segments per call"}, status=400
+                    )
+                if any(len(s) > 500 for s in segs):
+                    return web.json_response(
+                        {"status": "error", "error": "each segment is at most 500 chars"}, status=400
+                    )
+                # 回移 dsh PR #25：分段工具绕过出站管线，按同一套规则清洗
+                # Markdown（清洗后为空的段按既有丢弃语义直接不发送）。
+                u = _load_onebot_utils()
+                cleaned = [c for c in (u.strip_markdown(s).strip() for s in segs) if c]
+                if not cleaned:
+                    return web.json_response(
+                        {"status": "error", "error": "no sendable content after markdown strip"},
+                        status=400,
+                    )
+                if len(cleaned) < len(segs):
+                    logger.info(
+                        "[onebot] /api/send_media segments: %d/%d dropped after "
+                        "markdown strip: chat=%s",
+                        len(segs) - len(cleaned), len(segs), chat_id,
+                    )
+                kind_cid, target = _split_chat_id(chat_id)
+                message_id = None
+                for seg_text in cleaned:
+                    seg_params: Dict[str, Any] = {"message": [
+                        {"type": "text", "data": {"text": seg_text}}
+                    ]}
+                    if kind_cid == "group":
+                        seg_params["group_id"] = int(target)
+                    else:
+                        seg_params["user_id"] = int(target)
+                    resp = await self._call_action("send_msg", seg_params, timeout=30.0)
+                    mid = resp.get("message_id") if isinstance(resp, dict) else None
+                    if mid is not None:
+                        message_id = str(mid)
             else:  # forward
                 nodes = payload.get("nodes") or []
                 if not isinstance(nodes, list) or not nodes:
@@ -2365,11 +2412,9 @@ class OneBotAdapter(BasePlatformAdapter):
                         )
 
             # QQ doesn't render Markdown — convert common syntax to readable
-            # plain text BEFORE splitting so text chunks are clean.
+            # plain text BEFORE delivery so the bubble is clean.
             raw_content = content or ""
             content = _load_onebot_utils().strip_markdown(raw_content)
-
-            parts = _load_onebot_utils()._split_reply(content or "", self._split_length)
 
             # Long content → single text-image message instead of text.
             # Text-image path receives the RAW markdown so the AstrBot-style
@@ -2403,30 +2448,30 @@ class OneBotAdapter(BasePlatformAdapter):
                     )
                 except Exception as e:
                     logger.warning(
-                        "[onebot] text-image render failed (%s) — falling back to text chunks", e
+                        "[onebot] text-image render failed (%s) — falling back to single text", e
                     )
 
-            if not parts and not media_segments:
+            if not content and not media_segments:
                 if is_final:
                     await self._recall_loop_buffer(chat_id)
                 return SendResult(success=True, message_id=None)
 
+            # 方案 B（dsh b19fa5e 回移，防异常分段）：正文不再按标点分段——
+            # ≤阈值内容或卡片渲染失败回退一律整段单条发送，杜绝词中/URL/
+            # 代码框被拦腰切断、interim 拆成同文重复气泡等问题。
+            message_segments: List[Dict[str, Any]] = [
+                {"type": "text", "data": {"text": content}}
+            ]
+            message_segments.extend(media_segments)
+            send_params = dict(params)
+            send_params["message"] = message_segments
+            data = await self._call_action("send_msg", send_params)
+            mid = data.get("message_id")
             last_message_id: Optional[str] = None
-            for idx, part in enumerate(parts):
-                chunk_segments: List[Dict[str, Any]] = [
-                    {"type": "text", "data": {"text": part}}
-                ]
-                # Attach media to the final chunk.
-                if idx == len(parts) - 1:
-                    chunk_segments.extend(media_segments)
-                chunk_params = dict(params)
-                chunk_params["message"] = chunk_segments
-                data = await self._call_action("send_msg", chunk_params)
-                mid = data.get("message_id")
-                if mid is not None:
-                    last_message_id = str(mid)
-                    if _buf_sent_flag:
-                        _buf_sent_ids.append((last_message_id, part))
+            if mid is not None:
+                last_message_id = str(mid)
+                if _buf_sent_flag:
+                    _buf_sent_ids.append((last_message_id, content))
 
             # interim 文本消息记入缓冲, 等 final 到达后合并转发
             if _buf_sent_ids:

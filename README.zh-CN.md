@@ -6,7 +6,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 用户 (QQ) ←→ NapCat ←→ Hermes onebot 适配器 ←→ Hermes agent
                       ├─ 反向 WS 服务端 / 正向 WS 客户端（自动重连）
                       ├─ 入站：CQ 解析、图片下载、语音转写、引用/转发展开
-                      └─ 出站：分段发送、markdown 剥离、[[qq_forward]]、图/音/视频/文件
+                      └─ 出站：单条/t2i 卡片发送、markdown 剥离、[[qq_forward]]、图/音/视频/文件
 ```
 
 > 运行 `hermes gateway setup` 并选择 **QQ (OneBot)** 有引导式配置。
@@ -19,9 +19,9 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件解析（群文件 CDN 直链 `get_group_file_url`、私聊 CDN 直链 `get_private_file_url`、`get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
 | 语音 | ffmpeg 转 16 kHz 单声道 WAV → Hermes STT 管线；无 URL 语音先经 `get_record`（base64）取；失败降级 `[语音]` |
 | 文字图 | AstrBot 风格 t2i 卡片渲染器：标题/粗体/斜体/删除线/引用/列表/代码块/**表格**/行内 code 胶囊/彩色 emoji/中文标点禁则；800px 宽 |
-| 出站 | 按句号分段（默认 ≤100 字/条）、**>150 字渲染 t2i 文字图卡片**、Markdown 剥离为 QQ 纯文本、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **“本轮进展”小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
+| 出站 | 两档发送、**不再自动分段**（≤ 阈值单条文本、超阈值渲染 t2i 卡片）、Markdown 剥离为 QQ 纯文本、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **“本轮进展”小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
 | 命令 | 管理员本地斜杠命令：`/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`；其余斜杠照常流转网关核心 |
-| 工具 | `qq_send_image`（≤9 张，路径或 URL）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media`；`provides_tools` 让 CLI/TUI 也可用 |
+| 工具 | `qq_send_image`（≤9 张，路径或 URL）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_send_segments`（显式分条 1–9 段，自行拆好每段）、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media`；`provides_tools` 让 CLI/TUI 也可用 |
 | 权限 | 管理员白名单（`ONEBOT_ALLOWED_USERS`）、dm/group 策略（open/allowlist/disabled）、群聊 @ 门控、受限成员 `[受限用户:仅问答]` 软限制、出站敏感意图审计 |
 | 运维 | 热加载 `onebot_utils.py` / `t2i_render.py`（`extra.hot_reload`，免网关重启）、临时媒体 TTL 清理、启动时 t2i 墨源自检（字体链自测） |
 
@@ -98,7 +98,6 @@ gateway:
         group_policy: open         # open | allowlist | disabled
         group_allow_from: []       # group_policy=allowlist 时的群 id
         admin_users: []            # 管理员；回退到 ONEBOT_ALLOWED_USERS
-        split_length: 100          # 长回复分段字符数
         text_image_threshold: 150  # 更长回复渲染文字图
         image_max_size: 2048       # 入站图片压缩（0 = 保持原样）
         poke_reply: false          # bot 自己被戳时轻提示回复
@@ -119,8 +118,7 @@ gateway:
 | `group_policy` | `open` | `open` / `allowlist` / `disabled` |
 | `group_allow_from` | `[]` | `group_policy=allowlist` 时的允许群 id |
 | `admin_users` | `[]` | 管理员 QQ id；回退到 `ONEBOT_ALLOWED_USERS` |
-| `split_length` | `100` | 长回复分段阈值 |
-| `text_image_threshold` | `150` | t2i 卡片阈值；`<=0` 关闭卡片路径 |
+| `text_image_threshold` | `150` | t2i 卡片阈值；`<=0` 关闭卡片路径。旧配置里的 `split_length` 键被静默忽略——回复永不分段 |
 | `image_max_size` | `2048` | 入站图片长边上限（px）；`0` 保持原样 |
 | `max_inbound_file_bytes` | `20971520`（20 MB） | 入站文件大小上限；超限降级为 `[文件:name]` 标记 |
 | `interim_recall_seconds` | `90` | 未结算 interim 消息的自动撤回超时（`0` 关闭） |
@@ -280,15 +278,16 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 `require_mention: true`（默认）时机器人在群里只响应显式 @ 或回复**机器人自己发的消息**；回复其他人保持沉默，繁忙群不会被无关回复链误唤醒。被回复消息通过 `get_msg` 判定（与引用取原文共用同一次调用，无额外 API 开销）；无法判定被回复者时——取回失败/超时、原消息已撤回删除、或机器人自身 id 未知——回落为算提及（旧行为），防止撤回消息被回复后永不触发。设为 `false` 则响应每条群消息（很吵，大群不推荐）。未配置 `bot_qq` 时机器人从 OneBot meta 事件学自己的 id，@ 检测不需要额外设置。
 
-## 长回复（三档，全可配置）
+## 长回复（两档，全可配置）
 
-回复长度分三档处理。两个阈值都在平台 `extra` 块里可配（`split_length` 和 `text_image_threshold`）：
+回复长度分两档处理——文本**永不会被拆成多条气泡**（回移自 dsh-onebot 的
+splitLength 拆除，方案 B：标点窗口里没有标点时会把词拦腰切断，中间消息
+还会被拆成逐字同文的重复气泡）。阈值在平台 `extra` 块里可配（`text_image_threshold`）：
 
-- **≤ `split_length`**（默认 100）字：单条文本直接发。
-- **`split_length` 到 `text_image_threshold`**（默认 150）：按句子边界分段为多条（在 `。！？!?；;\n` 处断），句子从不被拦腰截断。
-- **> `text_image_threshold`**：渲染成黑字白底文字图（800px 宽、CJK 字体回退链）单张图片发送。卡片总高上限 8000px——超限中止渲染，回退为分段纯文本（与渲染失败同一路径）。渲染失败回退分段文本。
+- **≤ `text_image_threshold`**（默认 150）字：单条文本直接发。
+- **> `text_image_threshold`**：渲染成黑字白底文字图（800px 宽、CJK 字体回退链）单张图片发送。卡片总高上限 8000px——超限中止渲染，回退为整段单条纯文本（与渲染失败同一路径；不分段）。渲染失败回退单条整段文本。
 
-`text_image_threshold: 0` 关闭图片路径（全部走分段文本）；调高调低两个值可权衡消息条数与卡片渲染。
+`text_image_threshold: 0` 关闭图片路径（全部走单条文本）；调高调低该值可权衡消息条数与卡片渲染。
 
 文字图渲染器是 AstrBot 风格**元素化 Markdown 渲染器**：粗体 / 斜体 / 删除线 / 行内代码 / 代码块 / 标题 / 引用 / 列表和**表格**（AstrBot 自己没有表格元素）全部原生绘制。遵循中文排版规则：标点不落行首（行首禁则）、行内样式整体换行、纯文本里的字面 `\n` 变成真换行（行内代码里变空格，`\\n` 保留）、行内代码用浅蓝胶囊配等宽字体（拉丁/数字）+ 字形级回退（CJK）。知道回复对象昵称时卡片带 AstrBot 风格蓝色顶栏（`To <昵称>`，克莱因蓝 #002FA7，白字为**正文两倍字号**，约 68px 高），与 AstrBot 卡片头部比例一致。
 
@@ -314,7 +313,7 @@ macOS 什么都不用装（系统自带的 Hiragino Sans GB / Songti SC、Menlo 
 
 ## Markdown 与语音
 
-- **发送前剥离 Markdown**。QQ 不渲染它，所以 `**粗体**`、标题、列表、表格都转成可读纯文本（标题 → `【…】`、列表 → `•`、表格 → 空格分隔单元格、围栏代码块 → 边框框体）。这发生在分段和文字图渲染之前，图片也是干净的。
+- **发送前剥离 Markdown**。QQ 不渲染它，所以 `**粗体**`、标题、列表、表格都转成可读纯文本（标题 → `【…】`、列表 → `•`、表格 → 空格分隔单元格、围栏代码块 → 边框框体）。这发生在文字图渲染之前，图片也是干净的。强调标记只在词边界处剥（回移 dsh PR #32 / f809d27）：`foo_bar_baz.py`、文件路径、URL、`3*4*5` 原样保留，真强调（`_italic_`、`**粗体**`）照常剥。
 - **入站语音自动转写**：适配器下载语音片段，`ffmpeg` 转 16 kHz 单声道 WAV 后交给 Hermes STT 管线。NapCat 私聊语音常常只有 file hash（无 URL）：适配器先调 OneBot `get_record` 取 base64 音频再走下载→ffmpeg→STT 管线。
 
   STT 用全局 `stt:` 配置（与其他平台同一管线）：`provider: local` 在 Hermes 主机跑 faster-whisper（模型 = `stt.local.model`，默认 `small`，首次自动下载）；`provider: openai` 调 OpenAI 兼容端点（配 `stt.openai.*` + API key）。要求：装了 `ffmpeg`；没有它（或 STT 后端不可用）语音降级为 `[语音]` 标记。适配器启动时会用 `shutil.which` 探测一次 `ffmpeg`，缺失即打 WARNING 并附安装指引——装上前语音转文字不可用。
@@ -409,7 +408,7 @@ HTTP 等价物：适配器本地 API 的 `GET /api/napcat`（action 代理）和
 
 ## 热加载
 
-通过 `extra.hot_reload: true` 启用（默认**关**，仅开发用）。开启后 `onebot_utils.py`（纯函数：CQ 解析、分段、markdown 剥离、表情映射）和 `t2i_render.py`（文字图渲染器）每次使用都会检测：适配器 stat 文件 mtime，变了就 `importlib.reload`，调样式/规则免网关重启。`adapter.py` 自身的改动仍需重启。
+通过 `extra.hot_reload: true` 启用（默认**关**，仅开发用）。开启后 `onebot_utils.py`（纯函数：CQ 解析、markdown 剥离、表情映射）和 `t2i_render.py`（文字图渲染器）每次使用都会检测：适配器 stat 文件 mtime，变了就 `importlib.reload`，调样式/规则免网关重启。`adapter.py` 自身的改动仍需重启。
 
 ## 隐私与数据
 

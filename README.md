@@ -8,7 +8,7 @@ The OneBot adapter connects Hermes to QQ through the **OneBot 11 protocol**, com
 User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
                       ├─ reverse WS server / forward WS client (auto-reconnect)
                       ├─ inbound: CQ parsing, image download, voice STT, quote / forward expand
-                      └─ outbound: split sends, markdown strip, [[qq_forward]], image/voice/video/file
+                      └─ outbound: single / t2i-card send, markdown strip, [[qq_forward]], image/voice/video/file
 ```
 
 > Run `hermes gateway setup` and pick **QQ (OneBot)** for a guided walk-through.
@@ -21,9 +21,9 @@ User (QQ) ←→ NapCat ←→ Hermes onebot adapter ←→ Hermes agent
 | Inbound | private/group chats, segment-array parsing first (CQ-string fallback), CQ unescaping, @/reply trigger detection (fail-closed), **image resolution (url/base64/file/hash via `get_image`)** + downscale, file/voice/video/face/json/poke segment types, quote original message (`get_msg`), **file resolution (group CDN direct `get_group_file_url`, private CDN direct `get_private_file_url`, `get_file` base64/url fallback)**, poke-notice reply when the bot itself is poked (opt-in, `poke_reply`) |
 | Voice | ffmpeg → 16 kHz mono WAV → Hermes STT pipeline; voice without a URL fetched via `get_record` (base64); failure degrades to `[语音]` |
 | Text image | AstrBot-style t2i card renderer: headings / bold / italic / strikethrough / quote / list / code block / **table** / inline-code pill / color emoji / CJK punctuation rules; 800 px wide |
-| Outbound | sentence-boundary split (default ≤100 chars), **>150 chars rendered as a t2i card**, markdown stripped to plain text, `[[qq_forward]]` merged forwarding, **loop interim merge + recall** (turn-end **"本轮进展" summary card**, 60 ms recall spacing), typing indicator (private chats) |
+| Outbound | two-tier send, **no auto splitting** (≤ threshold one text bubble, above it a t2i card), markdown stripped to plain text, `[[qq_forward]]` merged forwarding, **loop interim merge + recall** (turn-end **"本轮进展" summary card**, 60 ms recall spacing), typing indicator (private chats) |
 | Commands | admin-only local slash commands: `/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`; other slashes keep flowing to the gateway core |
-| Tools | `qq_send_image` (≤9, path or URL), `qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`, `qq_napcat_api` (15-action whitelist), `qq_group_history`; HTTP `/api/napcat` + `/api/send_media`; available in CLI/TUI too via `provides_tools` |
+| Tools | `qq_send_image` (≤9, path or URL), `qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`, `qq_send_segments` (explicit 1–9 bubbles, you split the text), `qq_napcat_api` (15-action whitelist), `qq_group_history`; HTTP `/api/napcat` + `/api/send_media`; available in CLI/TUI too via `provides_tools` |
 | Permissions | admin allowlist (`ONEBOT_ALLOWED_USERS`), dm/group policy (open/allowlist/disabled), group mention gating, restricted-member `[受限用户:仅问答]` soft limits, outbound sensitive-intent audit |
 | Ops | hot reload for `onebot_utils.py` / `t2i_render.py` (`extra.hot_reload`, no gateway restart), temp-media TTL cleanup, startup t2i ink check (font chain self-test) |
 
@@ -100,7 +100,6 @@ gateway:
         group_policy: open         # open | allowlist | disabled
         group_allow_from: []       # group ids when group_policy=allowlist
         admin_users: []            # admins; falls back to ONEBOT_ALLOWED_USERS
-        split_length: 100          # long replies split at this many chars
         text_image_threshold: 150  # longer replies render as a text image
         image_max_size: 2048       # downscale inbound images (0 = keep as-is)
         poke_reply: false          # light reply when the bot itself gets poked
@@ -121,8 +120,7 @@ gateway:
 | `group_policy` | `open` | `open` / `allowlist` / `disabled` |
 | `group_allow_from` | `[]` | allowed group ids when `group_policy=allowlist` |
 | `admin_users` | `[]` | admin QQ ids; falls back to `ONEBOT_ALLOWED_USERS` |
-| `split_length` | `100` | long-reply split threshold |
-| `text_image_threshold` | `150` | t2i card threshold; `<=0` disables the card path |
+| `text_image_threshold` | `150` | t2i card threshold; `<=0` disables the card path. A legacy `split_length` key in existing configs is silently ignored — replies are never split |
 | `image_max_size` | `2048` | inbound image long-edge cap (px); `0` keeps originals |
 | `max_inbound_file_bytes` | `20971520` (20 MB) | inbound file size cap; larger files degrade to a `[文件:name]` marker |
 | `interim_recall_seconds` | `90` | auto-recall timeout for unsettled interim messages (`0` disables) |
@@ -302,17 +300,19 @@ main message flow.
 
 With `require_mention: true` (default), the bot only responds in groups when it is explicitly @'d or when the message replies to a message the bot itself sent. Replying to someone else stays silent, so busy groups are no longer woken by unrelated reply chains. The replied-to message is resolved with `get_msg` — the same fetch used for quote text, so there is no extra API call — and when the sender cannot be determined (fetch failed or timed out, the original message was recalled and deleted, or the bot's own id is still unknown) the bot falls back to treating the reply as a mention, so replies to recalled messages still trigger. Set it to `false` to respond to every group message (noisy; not recommended for large groups). When no `bot_qq` is configured the bot learns its own id from OneBot meta events, so mention detection works out of the box.
 
-## Long replies (three tiers, fully configurable)
+## Long replies (two tiers, fully configurable)
 
-Reply length is handled in three tiers. Both thresholds are user-configurable
-(`split_length` and `text_image_threshold` in the platform `extra` block):
+Reply length is handled in two tiers — text is **never split into multiple
+bubbles** (ported from dsh-onebot's splitLength removal, 方案 B: sentence-
+window splitting cut words mid-way when a window held no punctuation and
+duplicated interim messages as identical bubbles). One threshold is
+user-configurable (`text_image_threshold` in the platform `extra` block):
 
-- **≤ `split_length`** (default 100) characters: sent as a single text message.
-- **`split_length` to `text_image_threshold`** (default 150): split into multiple messages, breaking at sentence boundaries (`。！？!?；;\\n`) so sentences are never cut in half.
-- **> `text_image_threshold`**: rendered as a black-on-white text image (800 px wide, CJK-aware font fallback chain) and sent as a single image message. The card is capped at a total height of 8000 px — taller content aborts the render and falls back to plain text chunks (the same fallback as a failed render). Falls back to text chunks if rendering fails.
+- **≤ `text_image_threshold`** (default 150) characters: sent as a single text message.
+- **> `text_image_threshold`**: rendered as a black-on-white text image (800 px wide, CJK-aware font fallback chain) and sent as a single image message. The card is capped at a total height of 8000 px — taller content aborts the render and falls back to the whole text as a single plain-text message (the same fallback as a failed render; no splitting).
 
-Set `text_image_threshold: 0` to disable the image path (everything splits as text);
-raise/lower either value to tune the trade-off between message count and card rendering.
+Set `text_image_threshold: 0` to disable the image path (everything is sent as a single text message);
+raise/lower the value to tune the trade-off between message count and card rendering.
 
 The text-image renderer is an AstrBot-style **element-based Markdown renderer**: bold / italic / strikethrough / inline code / code blocks / headers / quotes / lists and **tables** (AstrBot itself has no table element) are all drawn natively. Chinese typography rules are honored. Punctuation never starts a line (行首禁则), inline styles wrap as a whole line, literal `\\n` in plain text becomes a real line break (inside inline code it becomes a space; `\\\\n` is kept), and inline code uses a light-blue pill with a monospace font for Latin/digits and glyph-level fallback for CJK. When the reply target's nickname is known, the card gets an AstrBot-style blue top bar (`To <nickname>`, Klein blue #002FA7, white text at **twice the body font size**, ~68 px tall), matching AstrBot's card header proportions.
 
@@ -339,7 +339,7 @@ macOS needs nothing (system Hiragino Sans GB / Songti SC, Menlo and Apple Color 
 
 ## Markdown & voice
 
-- **Markdown is stripped** before delivery. QQ does not render it, so `**bold**`, headings, lists, and tables are converted to readable plain text (headings → `【…】`, lists → `•`, tables → spaced cells, fenced code blocks → bordered boxes). This runs before splitting and text-image rendering, so images are clean too.
+- **Markdown is stripped** before delivery. QQ does not render it, so `**bold**`, headings, lists, and tables are converted to readable plain text (headings → `【…】`, lists → `•`, tables → spaced cells, fenced code blocks → bordered boxes). This runs before text-image rendering, so images are clean too. Emphasis markers only strip at word boundaries (dsh-onebot PR #32 / f809d27 port): `foo_bar_baz.py`, paths, URLs, and `3*4*5` survive; real emphasis like `_italic_` and `**bold**` still strips.
 - **Inbound voice messages are transcribed**: the adapter downloads the clip and converts it with `ffmpeg` to 16 kHz mono WAV, then hands it to Hermes' STT pipeline. NapCat private voice messages often carry only a file hash (no URL): the adapter calls the OneBot `get_record` action to fetch the base64 audio before the download→ffmpeg→STT pipeline.
 
   STT itself uses the global `stt:` config (same pipeline as other platforms):
@@ -435,7 +435,7 @@ HTTP equivalents: `GET /api/napcat` (action proxying) and `POST /api/send_media`
 
 ## Hot reload
 
-Opt-in via `extra.hot_reload: true` (default **off**, dev only). When enabled, `onebot_utils.py` (pure helpers: CQ parsing, splitting, markdown stripping, emoji map) and `t2i_render.py` (text-image renderer) are reloaded on every use: the adapter stats the file mtime and calls `importlib.reload` when it changed, so style/rule tweaks apply without a gateway restart. Changes to `adapter.py` itself still require a restart.
+Opt-in via `extra.hot_reload: true` (default **off**, dev only). When enabled, `onebot_utils.py` (pure helpers: CQ parsing, markdown stripping, emoji map) and `t2i_render.py` (text-image renderer) are reloaded on every use: the adapter stats the file mtime and calls `importlib.reload` when it changed, so style/rule tweaks apply without a gateway restart. Changes to `adapter.py` itself still require a restart.
 
 ## Privacy & data
 

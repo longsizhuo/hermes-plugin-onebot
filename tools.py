@@ -220,6 +220,27 @@ def qq_send_forward(args: Dict[str, Any], **kw) -> str:
     return _media_result(resp)
 
 
+def qq_send_segments(args: Dict[str, Any], **kw) -> str:
+    """Send several plain-text bubbles in explicit order (you split the text)."""
+    segments = args.get("segments") or []
+    if not isinstance(segments, list) or not segments:
+        return "qq_send_segments: segments must be a non-empty list of strings / segments 不能为空"
+    segments = [s for s in segments if isinstance(s, str) and s.strip()]
+    if not segments:
+        return "qq_send_segments: every segment must be a non-empty string / 每段都需为非空文本"
+    if len(segments) > 9:
+        return "qq_send_segments: at most 9 segments per call / 一次最多 9 段"
+    if any(len(s) > 500 for s in segments):
+        return "qq_send_segments: each segment is at most 500 chars / 每段最多 500 字"
+    chat_id = _resolve_chat(args.get("chat_id"))
+    resp = _http(
+        "POST",
+        "/api/send_media",
+        {"chat_id": chat_id, "kind": "segments", "segments": segments, "session_chat": _session_chat()},
+    )
+    return _media_result(resp)
+
+
 def qq_napcat_api(args: Dict[str, Any], **kw) -> str:
     """Proxy a whitelisted NapCat OneBot action."""
     action = str(args.get("action") or "")
@@ -261,6 +282,7 @@ _HANDLERS: Dict[str, Any] = {
     "qq_send_video": qq_send_video,
     "qq_send_file": qq_send_file,
     "qq_send_forward": qq_send_forward,
+    "qq_send_segments": qq_send_segments,
     "qq_napcat_api": qq_napcat_api,
     "qq_group_history": qq_group_history,
 }
@@ -335,6 +357,18 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
             },
             "required": ["nodes"],
         },
+        "qq_send_segments": {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered text bubbles, one send_msg each; 1-9 segments, each <=500 chars and non-empty. Split the text yourself — nothing is split automatically (分段文本列表，按顺序逐条发送；最多 9 段、每段 <=500 字，需自行拆好)",
+                },
+                "chat_id": chat_id,
+            },
+            "required": ["segments"],
+        },
         "qq_napcat_api": {
             "type": "object",
             "properties": {
@@ -365,6 +399,7 @@ _DESCRIPTIONS = {
     "qq_send_video": "Send a video message to a QQ chat (absolute path of a local video file). 发送视频到 QQ 会话。",
     "qq_send_file": "Send a file to a QQ chat (absolute path of a local file). 发送文件到 QQ 会话。",
     "qq_send_forward": "Send a merged forward to a QQ chat (chat-history card of named node messages). 发送合并转发。",
+    "qq_send_segments": "Send several plain-text QQ bubbles in explicit order — use ONLY when you want separate bubbles; you split the text yourself (1-9 segments, each <=500 chars). 按顺序发送多条独立文本气泡（仅明确需要分条呈现时使用，自行拆好每段）。",
     "qq_napcat_api": "Call a whitelisted NapCat OneBot action (member queries / file URLs / OCR / AI etc.). 调用白名单内的 NapCat action。",
     "qq_group_history": "Pull recent QQ group message history for summarization or monitoring. 拉取 QQ 群最近消息历史。",
 }
