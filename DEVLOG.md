@@ -805,3 +805,14 @@ fetchJSON、register 名匹配 manifest）。**199 passed + 4 skipped**
 
 版本 1.8.1 → 1.9.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
 manifest 四处同步）。
+
+### v1.9.0 部署验证（同日）
+
+- 生产 `hermes plugins update` 再次 git 超时（60s）→ 手动 `git pull --ff-only`
+  立即成功（超时是 update 流程自身的 git 调用问题；遗留一个无害的
+  update-autostash），安装目录到 7b6c8d4
+- 重启后：3 platform(s)、✓ onebot connected、NapCat connected
+- 9120 实测：`/api/dashboard/plugins` 含 onebot-platform（tab /onebot，
+  after:plugins）✓；插件 API 未认证请求正确 401（gated 模式 auth 门生效，
+  `login_url: /login`）✓；端点功能由 6 个单测覆盖（TestClient 直测 router）
+- 用户侧验收路径：浏览器登录 Webapp → 「QQ (OneBot)」页签
