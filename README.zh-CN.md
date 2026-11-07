@@ -295,6 +295,8 @@ splitLength 拆除，方案 B：标点窗口里没有标点时会把词拦腰切
 
 卡片渲染器需要三个字体族（CJK / 等宽 / 彩色 emoji），自动注册自系统；字形缺失会渲染成豆腐块。
 
+**macOS / Windows 无需安装任何字体**——候选链自动命中系统字体（v1.5.1）：macOS 走 Hiragino Sans GB → STHeiti → PingFang（CJK）、Menlo（等宽）、Apple Color Emoji（彩色 emoji，sbix 位图提取）；Windows 走微软雅黑 → 中易宋体 → 黑体（CJK）、Consolas / Cascadia（等宽）。下表适用于 Linux 服务器。
+
 | 依赖 | 提供（自动注册路径） | 用途 |
 |---|---|---|
 | `fonts-noto-cjk` | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | 中文正文/标题（自动选中 ttc SC face，JP/Mono 回退） |

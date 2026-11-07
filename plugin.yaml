@@ -1,7 +1,7 @@
 name: onebot-platform
 label: QQ (OneBot)
 kind: platform
-version: 1.5.0
+version: 1.5.1
 description: >
   QQ bot via the OneBot 11 protocol — compatible with NapCat, Lagrange,
   LLOneBot, go-cqhttp, SnowLuma. Reverse-WebSocket server or forward

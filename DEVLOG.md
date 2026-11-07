@@ -612,3 +612,37 @@ DEVLOG §2026-09-14（splitLength 拆除，方案 B）+ PR #32 + f809d27。
   超 9/超 500/清洗后全空）。
 
 版本保持 v1.5.0（与 §18 同一批发布）。
+
+## 20. t2i 字体链平台化：macOS/Windows 系统字体自动命中（2026-11-07，v1.5.1）
+
+生产网关（macOS）启动一直报 `t2i ink check FAILED: loaded=[] cjk=False`——
+`_FONT_FALLBACK_PATHS` 只有 Linux 路径，非 Linux 机器上 t2i 卡片档位恒渲染
+失败、走纯文本回退（v1.5.1 前等于卡片功能在这类机器上关闭）。回移 dsh
+fonts.ts 的多平台候选口径为**文件路径版**（本仓是 PIL 按路径探测，非 fontkit
+按族名注册）。
+
+### 改动（t2i_render.py）
+
+| 项 | 口径 |
+|---|---|
+| CJK 链 `_platform_font_paths()` | macOS：Hiragino Sans GB → STHeiti Light/Medium → PingFang（旧版 macOS）→ Songti → Arial Unicode；Windows：msyh.ttc（雅黑）→ simsun → simhei → DENG → simkai → simfang → msjh；Linux：原序不变 |
+| 等宽 `_platform_mono_paths()` | macOS：Menlo → Courier New；Windows：Consolas → Cascadia Code/Mono → Courier New；Linux：不变 |
+| emoji `_platform_emoji_paths()` | macOS：Apple Color Emoji（sbix）→ Noto（CBDT）；其余 Noto |
+| sbix 支持 | Apple Color Emoji 是 sbix 格式：取 ≥64ppem 最小 strike，glyph.imageData 包成 CBDT 式 `data.data`，`_emoji_bitmap` 的 PNG 魔数搜索零改动复用；COLR（Segoe UI Emoji）位图外格式跳过 |
+| `_prefer_sc_face()`（新，可单测） | ttc face 三段优先级：CJK SC（Noto）→ SC+Regular/W3（避开 Songti SC Black 等重字重）→ 任意 SC 排除 TC/HK/JP/Mono/隐藏 Interface；无 SC 标记回 0（Hiragino 0=W3 ✓） |
+
+### 验证（本机 macOS 27）
+
+- `ink_check()`：ok=True、cjk=True、loaded 6 字体（Hiragino 首位）。
+- 真实渲染 PNG（标题/粗体/行内 code/彩色 🙂/表格）目检通过。
+- 测试 +3：平台候选函数（monkeypatch sys.platform 三平台）、_prefer_sc_face
+  优先级矩阵、Apple Color Emoji 位图（存在才跑）；**172 passed + 4 skipped**
+  （169 + 3，零回归）。
+
+### 已知限制
+
+- Windows 无彩色 emoji 候选（Segoe UI Emoji 是 COLRv1，PIL/fontTools 位图路
+  径出不了）→ emoji 走 CJK 链字形，与 base 行为一致。
+- Linux CI / 容器行为零变化（候选序与文件完全同前）。
+
+版本 1.5.0 → 1.5.1（plugin.yaml / PLUGIN_VERSION / /ver 断言三处同步）。

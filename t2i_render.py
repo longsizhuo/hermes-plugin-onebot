@@ -13,20 +13,54 @@ t2i/local_strategy.py：Markdown 解析为元素 → 两遍流程（先算高再
 from __future__ import annotations
 
 import io
+import os
 import re
+import sys
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
 # ── 字体字形级回退链（与 adapter.py 一致）───────────────────────────────
-_FONT_FALLBACK_PATHS = [
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/opentype/unifont/unifont.otf",
-    "/usr/share/fonts/opentype/unifont/unifont_upper.otf",
-]
+def _platform_font_paths() -> List[str]:
+    """按平台给出 CJK 字体候选路径（dsh fonts.ts 候选口径的文件路径版）。
+
+    Linux 候选保持原序；macOS 命中 Hiragino Sans GB（各版本 macOS 都有）
+    → STHeiti → PingFang（旧版）→ Songti → Arial Unicode；Windows 命中
+    微软雅黑系 → 中易系。缺失文件由 build_font_chain 逐个剔除，列表只是
+    候选优先序。
+    """
+    if sys.platform == "darwin":
+        return [
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+    if sys.platform == "win32":
+        fdir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        return [
+            os.path.join(fdir, "msyh.ttc"),     # Microsoft YaHei（含 UI face）
+            os.path.join(fdir, "simsun.ttc"),   # SimSun / NSimSun
+            os.path.join(fdir, "simhei.ttf"),   # SimHei
+            os.path.join(fdir, "DENG.TTF"),     # DengXian
+            os.path.join(fdir, "simkai.ttf"),   # KaiTi
+            os.path.join(fdir, "simfang.ttf"),  # FangSong
+            os.path.join(fdir, "msjh.ttc"),     # JhengHei（繁体兜底）
+        ]
+    return [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/unifont/unifont.otf",
+        "/usr/share/fonts/opentype/unifont/unifont_upper.otf",
+    ]
+
+
+_FONT_FALLBACK_PATHS = _platform_font_paths()
 
 _FONT_CACHE: dict = {}
 _CMAP_CACHE: dict = {}
@@ -48,14 +82,48 @@ def ink_check(size: int = 26) -> Dict[str, Any]:
         "cjk": cjk_ok,
     }
 
-# ── 彩色 emoji 渲染（NotoColorEmoji CBDT 位图）─────────────────────────
-# 该字体是 CBDT/CBLC 彩色位图格式，PIL 不支持 embedded_color，所以直接
-# 用 fontTools 从 CBDT 表提取 PNG 位图，缩放到目标字号后按图片绘制。
-_EMOJI_FONT_PATH = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+# ── 彩色 emoji 渲染（CBDT / sbix 彩色位图）─────────────────────────────
+# NotoColorEmoji 是 CBDT/CBLC 彩色位图格式，Apple Color Emoji 是 sbix——
+# PIL 都不支持 embedded_color，所以用 fontTools 把位图 PNG 提出来，缩放到
+# 目标字号后按图片绘制。sbix 图像数据同样是 PNG 字节，_emoji_bitmap 的
+# PNG 魔数搜索天然兼容。
+def _platform_emoji_paths() -> List[str]:
+    """彩色 emoji 字体候选：macOS 优先 Apple Color Emoji（sbix），其余走 Noto（CBDT）。"""
+    if sys.platform == "darwin":
+        return [
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        ]
+    return ["/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"]
+
+
+_EMOJI_FONT_PATHS = _platform_emoji_paths()
 _EMOJI_TTFONT = None
 _EMOJI_STRIKE = None
 _EMOJI_CMAP = None
 _EMOJI_BITMAP_CACHE: dict = {}  # (ch, target_h) -> (img, w, h) | None
+
+
+def _sbix_strike(font):
+    """选一个 sbix strike（Apple Color Emoji），包成 CBDT 式 .get(glyph) 接口。
+
+    取 ≥64ppem 的最小 strike（26px 正文向下缩放质量足够）；glyph 名空间与
+    cmap 一致，imageData 直接是 PNG 字节。
+    """
+    from types import SimpleNamespace
+
+    strikes = font["sbix"].strikes  # {ppem: Strike}
+    if not strikes:
+        return None
+    ppem = min((p for p in strikes if p >= 64), default=min(strikes))
+    glyphs = strikes[ppem].glyphs
+
+    def get(name):
+        g = glyphs.get(name)
+        # 包成 CBDT 式 data.data（imageData 即 PNG 字节）
+        return SimpleNamespace(data=g.imageData) if g is not None else None
+
+    return SimpleNamespace(get=get)
 
 
 def _load_emoji_font():
@@ -65,9 +133,28 @@ def _load_emoji_font():
     try:
         from fontTools.ttLib import TTFont
 
-        _EMOJI_TTFONT = TTFont(_EMOJI_FONT_PATH, lazy=True)
-        _EMOJI_CMAP = _EMOJI_TTFONT.getBestCmap()
-        _EMOJI_STRIKE = _EMOJI_TTFONT["CBDT"].strikeData[0]
+        for path in _EMOJI_FONT_PATHS:
+            try:
+                font = TTFont(path, lazy=True, fontNumber=0)
+            except Exception:
+                continue
+            try:
+                cmap = font.getBestCmap()
+                if "CBDT" in font:
+                    strike = font["CBDT"].strikeData[0]
+                elif "sbix" in font:
+                    strike = _sbix_strike(font)
+                else:
+                    strike = None  # COLR 等位图外格式：PIL 出不了彩色位图
+                if strike is None or not cmap:
+                    continue
+                _EMOJI_TTFONT = font
+                _EMOJI_CMAP = cmap
+                _EMOJI_STRIKE = strike
+                return
+            except Exception:
+                continue
+        _EMOJI_TTFONT = False  # 全部候选不可用：禁用标记
     except Exception:
         _EMOJI_TTFONT = False  # 禁用标记
 
@@ -137,8 +224,39 @@ def _char_width(ch: str, chain) -> float:
     return _resolve_font(ch, chain).getlength(ch)
 
 
+def _prefer_sc_face(face_names: List[str]) -> int:
+    """从 face 全名列表里挑简体中文优先 face 的索引，无候选返回 0。
+
+    优先级（macOS 新增字体命名五花八门，三段兜底）：
+    1. "CJK SC"（Noto 命名）且非 Mono；
+    2. 含 SC 且带 Regular/W3（PingFang/Songti 命名，避开 Black 等重字重）；
+    3. 含 SC 且排除 TC/HK/JP/Mono/隐藏 Interface face；
+    都没有 → 0（Hiragino Sans GB 这类无 SC 标记的简体字体，0 就是常规字重）。
+    """
+    def has_sc(n: str) -> bool:
+        return bool(re.search(r"CJK SC|\bSC\b", n))
+
+    def excluded(n: str) -> bool:
+        return (
+            any(t in n for t in ("TC", "HK", "JP", "Mono"))
+            or n.startswith(".")
+            or "Interface" in n
+        )
+
+    for n in face_names:
+        if "CJK SC" in n and "Mono" not in n:
+            return face_names.index(n)
+    for n in face_names:
+        if has_sc(n) and not excluded(n) and ("Regular" in n or "W3" in n):
+            return face_names.index(n)
+    for n in face_names:
+        if has_sc(n) and not excluded(n):
+            return face_names.index(n)
+    return 0
+
+
 def _ttc_sc_index(path: str) -> int:
-    """在 ttc 集合里找简体中文（CJK SC）变体的字体索引。
+    """在 ttc 集合里找简体中文（SC）变体的字体索引（_prefer_sc_face 口径）。
 
     旧实现误把 name 记录枚举索引当作 ttc 字体索引，导致加载到
     JP/Mono/HK 等错误变体（字形变样 + 宽度度量异常）。
@@ -147,11 +265,13 @@ def _ttc_sc_index(path: str) -> int:
         from fontTools.ttLib import TTFont
 
         f0 = TTFont(path, lazy=True, fontNumber=0)
+        face_names: List[str] = []
         for i in range(f0.reader.numFonts):
             f = TTFont(path, lazy=True, fontNumber=i)
-            names = " ".join((x.toUnicode() or "") for x in f["name"].names)
-            if "CJK SC" in names and "Mono" not in names:
-                return i
+            face_names.append(
+                " ".join((x.toUnicode() or "") for x in f["name"].names)
+            )
+        return _prefer_sc_face(face_names)
     except Exception:
         pass
     return 0
@@ -755,10 +875,28 @@ def parse_inline(line: str):
     return out
 
 
-_MONO_FONT_PATHS = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Regular.otf",
-]
+def _platform_mono_paths() -> List[str]:
+    """等宽字体候选（代码块/行内 code），同 _platform_font_paths 的平台口径。"""
+    if sys.platform == "darwin":
+        return [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        ]
+    if sys.platform == "win32":
+        fdir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        return [
+            os.path.join(fdir, "consola.ttf"),       # Consolas
+            os.path.join(fdir, "CascadiaCode.ttf"),  # Windows 11
+            os.path.join(fdir, "CascadiaMono.ttf"),
+            os.path.join(fdir, "cour.ttf"),          # Courier New
+        ]
+    return [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Regular.otf",
+    ]
+
+
+_MONO_FONT_PATHS = _platform_mono_paths()
 _mono_font_cache: dict = {}
 
 

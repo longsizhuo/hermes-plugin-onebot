@@ -321,6 +321,12 @@ The text-image renderer is an AstrBot-style **element-based Markdown renderer**:
 The card renderer needs three font families (CJK / monospace / color emoji),
 auto-registered from the system; missing glyphs render as tofu boxes.
 
+**macOS / Windows need no font installation** — the candidate chain picks system
+fonts automatically (v1.5.1): macOS uses Hiragino Sans GB → STHeiti → PingFang
+(CJK), Menlo (mono), Apple Color Emoji (color emoji via sbix); Windows uses
+Microsoft YaHei → SimSun → SimHei (CJK), Consolas / Cascadia (mono). The
+table below applies to Linux servers.
+
 | Dependency | Provides (auto-registered path) | Used for |
 |---|---|---|
 | `fonts-noto-cjk` | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` | Chinese body/headers (ttc SC face auto-selected, JP/Mono fallback) |

@@ -2045,7 +2045,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.5.0" in t for t in texts)
+    assert any("onebot-plugin v1.5.1" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -2585,6 +2585,67 @@ def test_t2i_render_over_limit_raises() -> None:
     """超限：总高 > 8000px 抛 ValueError（不截断画布、不产生半渲染图）。"""
     with pytest.raises(ValueError, match="MAX_RENDER_HEIGHT"):
         render_text_image("超限的行\n" * 400)
+
+
+def test_platform_font_candidates_follow_sys_platform(monkeypatch) -> None:
+    """字体候选按平台切换（v1.5.1 回移 dsh fonts.ts 口径的文件路径版）。"""
+    from onebot_platform import t2i_render as t2i
+
+    monkeypatch.setattr(t2i.sys, "platform", "darwin")
+    mac = t2i._platform_font_paths()
+    assert mac[0] == "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    assert any("PingFang" in p for p in mac)
+    assert "/System/Library/Fonts/Menlo.ttc" in t2i._platform_mono_paths()
+    assert "/System/Library/Fonts/Apple Color Emoji.ttc" in t2i._platform_emoji_paths()
+
+    monkeypatch.setattr(t2i.sys, "platform", "win32")
+    win = t2i._platform_font_paths()
+    assert any("msyh" in p for p in win)
+    assert any("consola" in p for p in t2i._platform_mono_paths())
+    assert all("NotoColorEmoji" in p for p in t2i._platform_emoji_paths())
+
+    monkeypatch.setattr(t2i.sys, "platform", "linux")
+    linux = t2i._platform_font_paths()
+    assert linux[0] == "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    assert "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf" in t2i._platform_emoji_paths()
+
+
+def test_prefer_sc_face_picks_regular_weight() -> None:
+    """SC face 三段优先级：CJK SC → SC+Regular/W3 → 任意 SC；排除繁/港/日/隐藏。"""
+    from onebot_platform.t2i_render import _prefer_sc_face
+
+    # Noto 命名：CJK SC 直取
+    assert _prefer_sc_face(["Noto Sans CJK JP Regular", "Noto Sans CJK SC Regular"]) == 1
+    # Songti/PingFang 命名：避开 Black，取 Regular
+    assert (
+        _prefer_sc_face(["Songti SC Black", "Songti SC Regular", "Songti TC Regular"])
+        == 1
+    )
+    # TC 在前、SC 在后：排除 TC 取 SC
+    assert _prefer_sc_face(["PingFang TC Regular", "PingFang SC Regular"]) == 1
+    # 无 SC 标记（Hiragino Sans GB）：回 0（真实文件里 0 就是 W3 常规字重）
+    assert _prefer_sc_face(["Hiragino Sans GB W3", "Hiragino Sans GB W6"]) == 0
+    # 隐藏 Interface face 即使带 SC 也不当选
+    assert _prefer_sc_face(["Hiragino SC Interface W3", "Hiragino SC W3"]) == 1
+
+
+_APPLE_EMOJI = "/System/Library/Fonts/Apple Color Emoji.ttc"
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists(_APPLE_EMOJI),
+    reason="Apple Color Emoji not available in this environment",
+)
+def test_apple_color_emoji_sbix_bitmap() -> None:
+    """macOS：sbix（Apple Color Emoji）走位图提取，与 CBDT 同一调用面。"""
+    from onebot_platform.t2i_render import _emoji_bitmap
+
+    bm = _emoji_bitmap("🙂", 26)
+    assert bm is not None
+    img, w, h = bm
+    assert w > 0 and h == 26
+    # 非表情码点不走位图路径
+    assert _emoji_bitmap("中", 26) is None
 
 
 def test_send_t2i_over_limit_falls_back_to_single_text(monkeypatch) -> None:
