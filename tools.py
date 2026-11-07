@@ -108,19 +108,23 @@ def _access_token() -> str:
 def _segments_enabled() -> bool:
     """qq_send_segments 插件页开关（extra.segments_enabled，默认开）。
 
-    读 gateway 配置失败按开启处理（与 _access_token 同款降级：工具层
-    永远 importable，最终以适配器端点的同名校验兜底）。
+    用 ``load_config_readonly``（只读、无锁、毫秒级）而非
+    ``load_gateway_config``：本函数在网关 discovery 的 deadline worker
+    里被调用（register_tools），完整配置加载在该上下文会超时导致整个
+    插件被静默跳过（v1.8.0 生产事故，#23 节）。读失败按开启处理，端点
+    侧同名校验兜底。
     """
     try:
-        from gateway.config import Platform, load_gateway_config
+        from hermes_cli.config import load_config_readonly
 
-        pcfg = load_gateway_config().platforms.get(Platform("onebot"))
-        if pcfg is not None:
-            extra = getattr(pcfg, "extra", {}) or {}
-            return bool(extra.get("segments_enabled", True))
+        cfg = load_config_readonly() or {}
+        platforms = cfg.get("platforms") or {}
+        entry = platforms.get("onebot") or {}
+        extra = entry.get("extra") or {}
+        return bool(extra.get("segments_enabled", True))
     except Exception as e:  # noqa: BLE001 - tools must degrade to enabled
         logger.debug("[onebot-tools] segments_enabled lookup skipped: %s", e)
-    return True
+        return True
 
 
 def _http(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -742,3 +742,20 @@ wrap/净化、strip 三种模式、入站 wrap+命令裸文本+受限标记在�
 新配置键：`action_rate_per_minute`/`action_rate_per_day`/`segments_enabled`/
 `segments_interval_ms`。版本 1.7.0 → 1.8.0。**dsh-onebot 差距清单至此清零**
 （全部回移完成或判定宿主已有/无目标面）。
+
+### v1.8.0 生产事故与修复（同日热修，未提版号前落在本提交）
+
+v1.8.0 部署后网关启动 **onebot 平台静默消失**（"Gateway running with 2
+platform(s)"，'onebot' is not a valid Platform；无任何 loader 告警）。二分
+定位：checkout v1.7.0 恢复 3 平台 → 只回退 tools.py 也恢复 → **元凶是
+register_tools 在 discovery 的 deadline worker 里调用 `load_gateway_config()`**
+（完整配置加载在该上下文超时/失败，插件被静默跳过；`hermes plugins doctor`
+与隔离复现均正常，故只在完整网关里现形）。
+
+修复：`_segments_enabled()` 改用 `load_config_readonly`（只读无锁，宿主
+plugins_loader 在同一上下文读 plugins.load_timeout_seconds 的同款先例）。
+enabled=false 的「工具下线」语义保留（discovery 期跳过注册），端点拒绝兜底
+不变；intervalMs/其余逻辑不动。193 passed + 4 skipped 不变。
+
+教训：工具注册路径（discovery/deadline 上下文）里禁止完整配置加载——只读
+配置用 load_config_readonly。
