@@ -850,3 +850,15 @@ config 生效视图（settings > extra > default 三级优先 + 脱敏）、PUT 
 
 版本 1.9.0 → 1.10.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
 manifest 同步）。
+
+### v1.10.0 桌面端实测（computer-use，2026-11-08）
+
+Hermes 桌面应用重启（重跑插件 discovery）后：设置 → 插件 → onebot-platform
+**渲染完整 config_schema 表单**（26 键：下拉/数字步进/开关/textarea/密码框
+类型全对，Access Token 显示 ".env 存储说明"，Save settings 无改动时禁用），
+侧栏出现「插件 > onebot-platform」子页。当前生效值（来自 platforms.extra）
+正确显示；hub 保存后写 settings 命名空间（同键优先）。插件中心列表同时显示
+目录卡（1.3.0，待 PR #1 合并）与已安装卡（Git v1.10.0）。
+
+注意：**桌面应用需重启**才会重新 discovery 插件 manifest（旧进程内缓存无
+config_schema 时 hub 一直显示空态——这就是用户最初看到的空白）。
