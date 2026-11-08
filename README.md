@@ -133,7 +133,7 @@ gateway:
 | `action_rate_per_minute` / `action_rate_per_day` | `20` / `500` | proactive-write gate for the qq_* tools (minute sliding window + calendar-day counter); over-limit requests get 429 without consuming quota; audit trail at `media/qq-actions.log` (JSONL); query `GET /api/write_gate_stats`; both `0` disables the gate |
 | `segments_enabled` / `segments_interval_ms` | `true` / `0` | qq_send_segments switch (false takes the tool offline and the endpoint refuses) and the gap between adjacent bubbles (0-3000 ms; the tool's `intervalMs` argument overrides per call) |
 
-All of the above keys can be viewed/edited online in the Webapp (default `http://<host>:9120`) → the "QQ (OneBot)" tab (secrets are write-only); changes apply on gateway restart. See "Dashboard settings" below.
+The official editing surface for these keys is the **Desktop/TUI Settings → Plugins** hub (declarative forms from `config_schema`; secrets go to .env) — saves land in `plugins.entries.onebot-platform.settings`, which wins over this table (config.yaml extra stays as a compat fallback). The Webapp "QQ (OneBot)" tab (default `http://<host>:9120`) offers the same settings' status panel, forms and audit viewer; both entries write the same store, changes apply on gateway restart.
 | `hot_reload` | `false` | dev only: reload `onebot_utils.py` / `t2i_render.py` on mtime change (saves a gateway restart while iterating styles; keep off in production, an in-place write during upgrade can reload a half-written module) |
 | `poke_reply` | `false` | reply with a light hint (`@我` / `/help`) when the bot itself is poked (`notify/poke` notice); member-to-member pokes are ignored; per-chat 60s cooldown |
 

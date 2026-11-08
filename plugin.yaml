@@ -1,7 +1,7 @@
 name: onebot-platform
 label: QQ (OneBot)
 kind: platform
-version: 1.9.0
+version: 1.10.0
 description: >
   QQ bot via the OneBot 11 protocol — compatible with NapCat, Lagrange,
   LLOneBot, go-cqhttp, SnowLuma. Reverse-WebSocket server or forward
@@ -25,6 +25,54 @@ provides_tools:
 # T11 review #7: declared so the plugin loader installs it — no manual pip
 # step. Only needed by the text-to-image tier of long replies (fontTools
 # subsetter for CJK card rendering).
+# 插件设置声明（Desktop/TUI 设置→插件 hub 按 config_schema 自动渲染表单，
+# 保存写入 plugins.entries.onebot-platform.settings；type: secret 存 .env）。
+# adapter 读值优先级：hub settings > platforms.onebot.extra > config_schema default。
+config_schema:
+  mode: {type: str, choices: [reverse, forward], default: reverse,
+    label: "模式", description: "reverse = NapCat 拨入网关；forward = 适配器拨出"}
+  host: {type: str, default: "127.0.0.1", label: "监听地址",
+    description: "非 loopback 地址必须配置 access_token"}
+  port: {type: int, default: 8643, label: "端口"}
+  url: {type: str, default: "ws://127.0.0.1:3001", label: "正向 WS 目标",
+    description: "forward 模式的拨出目标"}
+  bot_qq: {type: str, default: "", label: "机器人 QQ",
+    description: "留空则从 meta 事件自动学习"}
+  access_token: {type: secret, env: ONEBOT_ACCESS_TOKEN, label: "Access Token",
+    description: "存入 .env；与桥一致，非 loopback 绑定时必填"}
+  require_mention: {type: bool, default: true, label: "群聊仅 @ 时响应"}
+  dm_policy: {type: str, choices: [open, allowlist, disabled], default: open,
+    label: "私聊策略", description: "open = 仅管理员"}
+  allow_from: {type: list, default: [], label: "私聊白名单（QQ 号）"}
+  group_policy: {type: str, choices: [open, allowlist, disabled], default: open,
+    label: "群聊策略"}
+  group_allow_from: {type: list, default: [], label: "群白名单（群号）"}
+  admin_users: {type: list, default: [], label: "管理员（QQ 号）",
+    description: "回退 ONEBOT_ALLOWED_USERS"}
+  allow_cidrs: {type: list, default: [], label: "SSRF 白名单网段",
+    description: "如 192.168.5.0/24；受信任内网协议端用"}
+  allow_private_hosts: {type: bool, default: false, label: "整体放行私网下载"}
+  text_image_threshold: {type: int, default: 150, label: "t2i 卡片阈值（字）",
+    description: "0 关闭卡片路径"}
+  outbound_image_max_bytes: {type: int, default: 8388608, label: "卡片 PNG 上限（字节）"}
+  image_max_size: {type: int, default: 1536, label: "入站图片长边上限（px）",
+    description: "0 保持原样"}
+  max_inbound_file_bytes: {type: int, default: 20971520, label: "入站文件上限（字节）"}
+  rate_limit_per_minute: {type: int, default: 30, label: "入站频控（条/分钟/chat）",
+    description: "0 关闭"}
+  action_rate_per_minute: {type: int, default: 20, label: "主动写频控（条/分钟）",
+    description: "0 关闭"}
+  action_rate_per_day: {type: int, default: 500, label: "主动写日配额（条）",
+    description: "0 关闭"}
+  interim_recall_seconds: {type: number, default: 90, label: "interim 自动撤回（秒）",
+    description: "0 关闭"}
+  segments_enabled: {type: bool, default: true, label: "启用 qq_send_segments"}
+  segments_interval_ms: {type: int, default: 0, label: "相邻段发送间隔（ms）",
+    description: "0-3000"}
+  poke_reply: {type: bool, default: false, label: "被戳轻提示回复"}
+  hot_reload: {type: bool, default: false, label: "热加载（仅开发）",
+    description: "onebot_utils/t2i_render 改动免重启"}
+
 python_dependencies:
   - "fonttools>=4,<5"
 optional_env:

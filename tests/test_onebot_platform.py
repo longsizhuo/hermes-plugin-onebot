@@ -2601,7 +2601,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.9.0" in t for t in texts)
+    assert any("onebot-plugin v1.10.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -5121,7 +5121,108 @@ def test_snowluma_bot_status_and_offline_notices_silently_ignored() -> None:
 
 @pytest.fixture()
 def _dashboard_client(monkeypatch, tmp_path):
-    """plugin_api router 的 TestClient：HERMES_HOME 重定向 + extra 预置。"""
+    """plugin_api router 的 TestClient：HERMES_HOME 重定向 + extra 预置。
+
+    save_config 被捕获（save_plugin_setting 内部经 config_mod.save_config
+    原子合并落盘）；hub settings 为空 → 生效视图回落 platforms.extra。
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("ONEBOT_ACCESS_TOKEN", raising=False)
+    fake_cfg = {
+        "platforms": {
+            "onebot": {
+                "enabled": True,
+                "extra": {
+                    "mode": "reverse", "host": "127.0.0.1", "port": 8643,
+                    "text_image_threshold": 150, "require_mention": True,
+                    "allow_from": ["10001"], "segments_enabled": True,
+                    "segments_interval_ms": 0,
+                },
+            }
+        }
+    }
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda: fake_cfg
+    )
+    saved_calls: list = []
+
+    def fake_save(cfg, **kwargs):
+        # save_plugin_settings 按键逐次调 save_config——记录全部调用
+        saved_calls.append(json.loads(json.dumps(cfg)))
+
+    monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    yield TestClient(app), saved_calls, plugin_api
+
+
+def test_dashboard_config_schema_view_and_redaction(_dashboard_client) -> None:
+    """GET /config：schema 驱动的生效视图（hub 空时回落 extra/default），
+    凭证脱敏为 has_access_token 布尔（env 未设 → False）。"""
+    client, _, _ = _dashboard_client
+    res = client.get("/config")
+    assert res.status_code == 200
+    cfg = res.json()["config"]
+    assert cfg["mode"] == "reverse" and cfg["port"] == 8643
+    assert cfg["text_image_threshold"] == 150
+    assert cfg["allow_from"] == ["10001"]
+    assert cfg["has_access_token"] is False
+    assert "access_token" not in cfg
+    # schema default 兜底（extra 未设的键）
+    assert cfg["rate_limit_per_minute"] == 30
+    assert cfg["poke_reply"] is False
+
+
+def test_dashboard_config_put_validates_and_saves(_dashboard_client) -> None:
+    """PUT /config：save_plugin_settings 正典写路径（settings 命名空间落盘），
+    未知键/枚举越界/非整数 400。"""
+    client, saved_calls, _ = _dashboard_client
+    ok = client.put("/config", json={"values": {
+        "mode": "forward",
+        "text_image_threshold": 200,
+        "allow_private_hosts": False,
+        "allow_from": ["10001", "10002"],
+        "rate_limit_per_minute": 15,
+    }})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["restart_required"] is True
+    assert body["written"] and set(body["written"]) == {
+        "mode", "text_image_threshold", "allow_private_hosts", "allow_from",
+        "rate_limit_per_minute",
+    }
+    merged: dict = {}
+    for call in saved_calls:
+        merged.update(json.loads(json.dumps(
+            call.get("plugins", {}).get("entries", {}).get("onebot-platform", {}).get("settings", {})
+        )))
+    assert merged["mode"] == "forward"
+    assert merged["text_image_threshold"] == 200
+    assert merged["allow_private_hosts"] is False
+    assert merged["allow_from"] == ["10001", "10002"]
+    assert merged["rate_limit_per_minute"] == 15
+
+    # 未知键 400（schema 外）
+    res = client.put("/config", json={"values": {"evil_key": 1}})
+    assert res.status_code == 400 and "evil_key" in res.json()["detail"]
+    # 枚举越界 400
+    res = client.put("/config", json={"values": {"mode": "sideways"}})
+    assert res.status_code == 400 and "mode" in res.json()["detail"]
+    # 非整数 400
+    res = client.put("/config", json={"values": {"port": "abc"}})
+    assert res.status_code == 400 and "port" in res.json()["detail"]
+    # secret 不走本端点
+    res = client.put("/config", json={"values": {"access_token": "new-token"}})
+    assert res.status_code == 400 and "secret" in res.json()["detail"]
+
+
+def test_dashboard_config_hub_settings_win_over_extra(monkeypatch, tmp_path) -> None:
+    """生效视图优先级：hub settings > platforms.extra > schema default。"""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -5131,82 +5232,25 @@ def _dashboard_client(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {
-            "platforms": {
-                "onebot": {
-                    "enabled": True,
-                    "extra": {
-                        "mode": "reverse", "host": "127.0.0.1", "port": 8643,
-                        "access_token": "s3cret-token", "text_image_threshold": 150,
-                        "require_mention": True, "allow_from": ["10001"],
-                        "segments_enabled": True, "segments_interval_ms": 0,
-                    },
-                }
-            }
+            "platforms": {"onebot": {"enabled": True, "extra": {
+                "mode": "reverse", "rate_limit_per_minute": 99,
+                "text_image_threshold": 150,
+            }}},
+            "plugins": {"entries": {"onebot-platform": {"settings": {
+                "mode": "forward", "rate_limit_per_minute": 10,
+            }}}},
         },
     )
-    saved: dict = {}
-
-    def fake_save(cfg):
-        saved.update(json.loads(json.dumps(cfg)))
-
-    monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
     app = FastAPI()
     app.include_router(plugin_api.router)
-    yield TestClient(app), saved, plugin_api
-
-
-def test_dashboard_config_redacts_token_and_whitelists(_dashboard_client) -> None:
-    """GET /config：凭证脱敏（has_access_token 布尔，不回显）；只出白名单键。"""
-    client, _, _ = _dashboard_client
-    res = client.get("/config")
-    assert res.status_code == 200
-    cfg = res.json()["config"]
-    assert cfg["has_access_token"] is True
-    assert "access_token" not in cfg
+    cfg = TestClient(app).get("/config").json()["config"]
+    # hub settings 赢 extra
+    assert cfg["mode"] == "forward"
+    assert cfg["rate_limit_per_minute"] == 10
+    # hub 未设 → extra
     assert cfg["text_image_threshold"] == 150
-    assert cfg["allow_from"] == ["10001"]
-    assert "unknown_key_never_leaks" not in json.dumps(cfg)
-
-
-def test_dashboard_config_put_validates_and_saves(_dashboard_client) -> None:
-    """PUT /config：白名单/枚举/类型校验；合法写落到 save_config；要求重启。"""
-    client, saved, _ = _dashboard_client
-    ok = client.put("/config", json={"values": {
-        "mode": "forward", "port": "9000",  # 数字以字符串来也能收敛
-        "text_image_threshold": 200, "allow_private_hosts": False,
-        "allow_from": ["10001", "10002"],
-    }})
-    assert ok.status_code == 200
-    body = ok.json()
-    assert body["restart_required"] is True
-    extra = saved["platforms"]["onebot"]["extra"]
-    assert extra["mode"] == "forward" and extra["port"] == 9000
-    assert extra["text_image_threshold"] == 200
-    assert extra["allow_private_hosts"] is False
-    assert extra["allow_from"] == ["10001", "10002"]
-    # access_token 未提交 → 原值保留
-    assert extra["access_token"] == "s3cret-token"
-
-    # 未知键 400
-    res = client.put("/config", json={"values": {"evil_key": 1}})
-    assert res.status_code == 400 and "evil_key" in res.json()["detail"]
-    # 枚举越界 400
-    res = client.put("/config", json={"values": {"mode": "sideways"}})
-    assert res.status_code == 400 and "mode" in res.json()["detail"]
-    # 非整数 400
-    res = client.put("/config", json={"values": {"port": "abc"}})
-    assert res.status_code == 400 and "port" in res.json()["detail"]
-
-
-def test_dashboard_config_token_write_roundtrip(_dashboard_client) -> None:
-    """access_token 只写不读：提交新值落盘，GET 仍只回 has_token。"""
-    client, saved, _ = _dashboard_client
-    res = client.put("/config", json={"values": {"access_token": "new-token"}})
-    assert res.status_code == 200
-    assert res.json()["config"]["has_access_token"] is True
-    assert "access_token" not in res.json()["config"]
-    assert "new-token" not in json.dumps(res.json())
-    assert saved["platforms"]["onebot"]["extra"]["access_token"] == "new-token"
+    # 都没有 → schema default
+    assert cfg["poke_reply"] is False
 
 
 def test_dashboard_status_uses_live_adapter(monkeypatch) -> None:
@@ -5242,6 +5286,39 @@ def test_dashboard_no_live_adapter_reports_not_running(monkeypatch) -> None:
     app.include_router(plugin_api.router)
     body = TestClient(app).get("/status").json()
     assert body == {"status": "ok", "running": False}
+
+
+def test_adapter_merges_hub_settings_over_extra(monkeypatch, tmp_path) -> None:
+    """adapter.__init__ 读 hub settings（同键优先于 extra）——hub 改了要生效。"""
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    hub = {"rate_limit_per_minute": 7, "require_mention": False,
+           "allow_from": ["555"]}
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"plugins": {"entries": {"onebot-platform": {"settings": hub}}}},
+    )
+    adapter = _make_adapter(rate_limit_per_minute=99, require_mention=True)
+    assert adapter._rate_limit_per_minute == 7
+    assert adapter._require_mention is False
+    assert adapter._allow_from == {"555"}
+    # hub 未覆盖的键回落 extra
+    assert adapter._text_image_threshold == 150
+
+
+def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:
+    """守卫（对齐宿主 auth contract 测试）：前端 bundle 不读 session token
+    全局、必须走 SDK.fetchJSON、按 manifest name 调 register。"""
+    bundle = (Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
+    assert "__HERMES_SESSION_TOKEN__" not in bundle, "禁止直接读 token（SDK.fetchJSON 是唯一鉴权面）"
+    assert "SDK.fetchJSON" in bundle or "fetchJSON(" in bundle
+    assert 'register("onebot-platform"' in bundle
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[1] / "dashboard" / "manifest.json").read_text()
+    )
+    assert manifest["name"] == "onebot-platform"
+    assert manifest["entry"] == "dist/index.js" and manifest["api"] == "plugin_api.py"
 
 
 def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:

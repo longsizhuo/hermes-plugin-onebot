@@ -131,7 +131,7 @@ gateway:
 | `action_rate_per_minute` / `action_rate_per_day` | `20` / `500` | qq_* 工具主动写频控闸（分钟滑动窗 + 自然日计数）；超限 429 拒绝且不占额度；审计落 `media/qq-actions.log`（JSONL）；查询 `GET /api/write_gate_stats`；两者均 `0` 关闭 |
 | `segments_enabled` / `segments_interval_ms` | `true` / `0` | qq_send_segments 开关（false 时工具下线、端点拒绝）与相邻段发送间隔（0–3000ms，工具 `intervalMs` 参数可按次覆盖） |
 
-以上键均可于 Webapp（默认 `http://<host>:9120`）→「QQ (OneBot)」页签在线查看/编辑（凭证只写不读），保存后重启网关生效；详见下方「Dashboard 设置页」。
+以上键的官方编辑面是 **桌面/TUI 的 设置→插件**（`config_schema` 声明式表单，secret 存 .env）——保存写入 `plugins.entries.onebot-platform.settings`，同键优先于本表（config.yaml extra 为兼容回退）。Webapp「QQ (OneBot)」页签（默认 `http://<host>:9120`）提供同一份设置的状态面板、表单与审计查看，两条入口写同一存储，保存后重启网关生效。
 | `hot_reload` | `false` | 仅开发用：`onebot_utils.py` / `t2i_render.py` 按 mtime 变化自动 reload（调样式免重启；生产建议关闭，升级时原地写入可能加载半截模块） |
 | `poke_reply` | `false` | bot 自己被戳（`notify/poke` notice）时回复轻提示（`@我` / `/help`）；成员互戳不响应；per-chat 60s 冷却 |
 

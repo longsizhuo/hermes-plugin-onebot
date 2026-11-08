@@ -33,7 +33,8 @@
         { key: "port", label: "端口", type: "int" },
         { key: "url", label: "正向 WS 目标", type: "str", help: "forward 模式用，如 ws://127.0.0.1:3001" },
         { key: "bot_qq", label: "机器人 QQ", type: "str", help: "留空则从事件自动学习" },
-        { key: "has_access_token", label: "Access Token", type: "token" },
+        { key: "has_access_token", label: "Access Token", type: "secret-badge",
+          help: "在 Desktop/TUI 设置→插件 编辑（存 .env）；非 loopback 绑定时必填" },
       ],
     },
     {
@@ -120,15 +121,13 @@
       const payload = {};
       for (const group of GROUPS) {
         for (const f of group.fields) {
-          if (!(f.key in values)) continue;
+          if (!(f.key in values) || f.type === "secret-badge") continue;
           if (f.type === "list") payload[f.key] = textToList(String(values[f.key] || ""));
-          else payload[f.key] = values[f.key];
+          else if (f.type === "int") {
+            const n = parseInt(String(values[f.key]), 10);
+            payload[f.key] = Number.isNaN(n) ? values[f.key] : n;
+          } else payload[f.key] = values[f.key];
         }
-      }
-      // token 特殊：只有用户输入了新值才提交（空 = 不修改）
-      const tokenInput = values._new_access_token;
-      if (tokenInput != null && String(tokenInput).trim() !== "") {
-        payload.access_token = String(tokenInput).trim();
       }
       setSaving(true);
       try {
@@ -139,7 +138,6 @@
         });
         setConfig(res.config || {});
         setValues(res.config || {});
-        setValues((prev) => ({ ...prev, _new_access_token: "" }));
         setSaved(res.restart_required !== false);
         setError("");
         setStatus(await fetchJSON(BASE + "/status").catch(() => status));
@@ -167,17 +165,9 @@
           onValueChange: (v) => setValue(f.key, v),
         },
           f.options.map((opt) => h(SelectOption, { key: opt, value: opt }, opt)));
-      } else if (f.type === "token") {
-        control = h("div", null,
-          h("div", { className: "mb-1 flex items-center gap-2" },
-            h(Badge, { variant: value ? "success" : "secondary" }, value ? "已配置" : "未配置"),
-            h("span", { className: "text-xs text-text-tertiary" }, "不回显；留空保持不变")),
-          h(Input, {
-            type: "password",
-            value: values._new_access_token || "",
-            placeholder: "输入新 token 覆盖",
-            onChange: (e) => setValue("_new_access_token", e.target.value),
-          }));
+      } else if (f.type === "secret-badge") {
+        control = h("div", { className: "pt-2" },
+          h(Badge, { variant: value ? "success" : "secondary" }, value ? "已配置（.env）" : "未配置"));
       } else {
         control = h(Input, {
           ...common,

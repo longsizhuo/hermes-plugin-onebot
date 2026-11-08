@@ -816,3 +816,37 @@ manifest 四处同步）。
   after:plugins）✓；插件 API 未认证请求正确 401（gated 模式 auth 门生效，
   `login_url: /login`）✓；端点功能由 6 个单测覆盖（TestClient 直测 router）
 - 用户侧验收路径：浏览器登录 Webapp → 「QQ (OneBot)」页签
+
+## 25. 声明式插件设置（Desktop 设置→插件 hub 对接）（2026-11-08，v1.10.0）
+
+用户实测：Hermes 桌面端的 设置→插件 页显示「还没有插件提供设置」。调研确认
+这是宿主**声明式设置机制**：`plugin.yaml` 的 `config_schema`（key →
+{type, label, description, default?, required?, choices?, secret?, env?}）
+由 `hermes_cli.plugins_settings` 渲染（Desktop hub 经 tui_gateway RPC 读
+`plugin_settings_fields`/写 `save_plugin_settings`），保存落
+`plugins.entries.<id>.settings`（secret 经凭证路由存 .env，env 名 = manifest
+`env:` 或 `<PLUGIN_ID>_<KEY>`）。类型集：str/int/float/bool/list/dict/secret，
+choices 的 string 渲染为 enum。**插件侧零代码——声明即生效。**
+
+### 落点
+
+| 层 | 改动 |
+|---|---|
+| plugin.yaml | `config_schema` 声明 26 键（与 adapter 实际读取键一一对应；access_token 为 type: secret + env: ONEBOT_ACCESS_TOKEN——hub 写 .env，`_standalone_access_token` 回退链可读，闭环） |
+| adapter.py | `_hub_settings()`（模块级，读失败零影响）+ `__init__` 合并：**hub settings 同键优先于 platforms.onebot.extra**（hub 是官方设置面；extra 为兼容回退，README 标注） |
+| dashboard/plugin_api.py | schema 驱动重写：GET /config = 生效视图（settings > extra > default，secret 脱敏）；PUT /config = `save_plugin_settings` 正典写路径（按 schema 校验，secret 拒绝并提示走 hub/.env；整数键前端字符串收敛） |
+| dashboard/dist/index.js | token 输入框移除（badge + 指引），int 字段提交前收敛为数字 |
+
+已知边界：hub 改动仍在 adapter.__init__ 读取——重启网关生效；宿主广播
+`settings.changed` 事件，热应用留待后续（adapter 需逐键重载，非简单 reload）。
+
+### 测试（新增 2 + 重写 5，全绿）
+
+config 生效视图（settings > extra > default 三级优先 + 脱敏）、PUT 正典写
+路径（落 settings 命名空间，save_config 按键多次调用需合并断言）、未知键/
+枚举/非整数/secret 400、status、无实例、前端守卫、adapter hub 合并
+（settings 覆盖 extra，未覆盖键回落）。**200 passed + 4 skipped**（199 + 1
+净增，零回归）。
+
+版本 1.9.0 → 1.10.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
+manifest 同步）。

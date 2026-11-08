@@ -113,7 +113,7 @@ IMAGE_MAX_BYTES = 8 * 1024 * 1024  # skip absurdly large CQ image downloads
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # voice/video/file base64 cap (NapCat upload)
 MAX_MESSAGE_LENGTH = 4000  # QQ per-message cap (UTF-16-ish, keep safe)
 
-PLUGIN_VERSION = "1.9.0"
+PLUGIN_VERSION = "1.10.0"
 
 # ── 入站媒体下载 SSRF 闸（回移 dsh PR #8/#20，2026-11-07）───────────────
 # 入站图片/语音/视频/文件的 URL 来自协议端，仍是不可信输入：私网/回环/
@@ -416,6 +416,10 @@ class OneBotAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("onebot"))
         extra = config.extra or {}
+        # Desktop/TUI 插件 hub（plugin.yaml config_schema）写入的设置存
+        # plugins.entries.<id>.settings——hub 是官方设置面，同键时优先于
+        # platforms.onebot.extra（config.yaml 兼容保留）。
+        extra = {**extra, **_hub_settings()}
         # 开发迭代开关：hot_reload=true 时 onebot_utils/t2i_render 修改即生效
         _set_hot_reload(
             str(extra.get("hot_reload", False)).strip().lower() in {"true", "1", "yes"}
@@ -3622,6 +3626,24 @@ def validate_config(config) -> bool:
     if mode not in ("reverse", "forward"):
         return False
     return True
+
+
+def _hub_settings() -> Dict[str, Any]:
+    """Desktop/TUI 插件 hub 写入的设置（plugin.yaml config_schema 声明的键）。
+
+    存于 config.yaml ``plugins.entries.onebot-platform.settings``；读失败
+    返回空 dict（hub 未使用时零影响）。__init__ 一次性读取，改后需重启。
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.plugins_state import _plugin_settings_entry
+
+        entry = _plugin_settings_entry(load_config_readonly() or {}, "onebot-platform")
+        settings = (entry or {}).get("settings")
+        return settings if isinstance(settings, dict) else {}
+    except Exception as e:  # noqa: BLE001 - hub 未启用/配置不可读时不影响加载
+        logger.debug("[onebot] hub settings unavailable: %s", e)
+        return {}
 
 
 def _build_adapter(config):
