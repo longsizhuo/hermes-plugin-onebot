@@ -862,3 +862,54 @@ Hermes 桌面应用重启（重跑插件 discovery）后：设置 → 插件 →
 
 注意：**桌面应用需重启**才会重新 discovery 插件 manifest（旧进程内缓存无
 config_schema 时 hub 一直显示空态——这就是用户最初看到的空白）。
+
+## 26. 入站多图编号 + 表情包拼网格（2026-11-11，v1.11.0，合入社区 PR #1）
+
+longsizhuo 的 PR #1（入站图片编号 + 表情包拼图）基点 v1.2 时代，与 v1.7.0
+回移的 dsh PR #44（表情包 `[表情包:<路径>]` 内联标签）正面冲突。拍板融合
+方案：以 PR #1 的「编号 + 网格」为基，PR #44 的路径暴露意图并入尾注。
+
+### 融合口径（关键决策）
+
+- **编号**：解析时下载成功的图放占位字符（照片/表情包两种），组事件前
+  `number_pictures` 按文本先后换成 `[图片N]` / `[表情N]`；失败保留不带编号
+  的 `[图片]` / `[表情包]`。引用消息的图排在最前，与 `[引用]` 文本顺序一致
+  （`media_urls[:0]` 前插）。
+- **拼图**：照片前 `image_attach_max`（默认 3）张单独附，表情包和超出的
+  照片每 9 张拼一张 768px 编号网格；`image_grid: false` 回逐张附（编号照
+  旧）。只剩 1 张可拼时拼了不省，直接单独附。
+- **PR #44 意图保留**：内联 `[表情包:<路径>]` 标签取消，改由 `picture_note`
+  尾注附「表情原文件路径：[表情N] <路径>」——网格格子是低清缩略，模型仍
+  可按路径引用/取原图。不拼图（单张 / `image_grid: false` / 拼图失败）时
+  路径说明由 `sticker_path_note` 独立成尾注。
+- **顺序不变量**：CQ 路径 image/mface 必须**一遍扫**（`_CQ_PICTURE_RE` 组合
+  正则，属性可选）——v1.7.0 的独立 `_CQ_MFACE_RE` 后置循环会把 mface 路径
+  追加在所有 image 之后，打乱「文本编号顺序 = 附图顺序」的配对。段数组路
+  径 image/mface 统一分支，原独立 mface 分支成死代码，删除。
+- **与 `<user_message>` 边界共存（v1.8.0）**：包裹在编号之前、尾注在边界
+  之外（尾注是适配器生成的可信元数据）；e2e 断言按「边界内正文 + 边界外
+  尾注」重钉。
+
+### 落点
+
+| 文件 | 改动 |
+|---|---|
+| onebot_utils.py | `PHOTO_MARK`/`STICKER_MARK`/`is_sticker`/`number_pictures`/`plan_pictures`/`make_picture_grid`（PR #1 原样）+ `sticker_path_clause`/`sticker_path_note`/`picture_note(sticker_paths=)`（融合新增）+ `_CQ_PICTURE_RE` |
+| adapter.py | `_budget_pictures`（编号/拼图/尾注总装，三条不拼图路径都带路径注）+ 双解析路径占位符 + CQ image\|mface 一遍扫 |
+| plugin.yaml | `config_schema` 增 `image_attach_max`（int，3）/ `image_grid`（bool，true） |
+| README 双语 | 入站图片节 + 配置表 + yaml 示例 |
+| 版本 | plugin.yaml / PLUGIN_VERSION / /ver 断言 / dashboard manifest 四处 1.10.0 → 1.11.0 |
+
+### 测试
+
+重钉 5（2 条 PR #44 内联标签断言 → 占位字符管线断言；3 条 e2e 适配
+`<user_message>` 边界 + 尾注路径）、新增 2（单表情包不拼图路径注、CQ
+mface/image 混排顺序防错位）、扩展 1（`picture_note` 路径参数）。**210
+passed + 4 skipped**（v1.10.0 基线 200 + 净增 10，零回归；
+`HERMES_AGENT_HOME=` 系统 hermes-agent v0.23.0+209 + 独立 venv）。
+
+### 遗留（评审建议项，留作者后续）
+
+- bool 型 extra 的字符串解析统一（`image_grid: "false"` 现按 truthy 处理）
+- mface 缺 url 时 get_image 兜底（现仅 url 直下，无 url 留 `[表情包]`）
+- `image_attach_max: 0` 语义注明（0 = 全部进拼图，无单独附照片）

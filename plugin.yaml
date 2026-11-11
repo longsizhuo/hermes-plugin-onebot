@@ -1,7 +1,7 @@
 name: onebot-platform
 label: QQ (OneBot)
 kind: platform
-version: 1.10.0
+version: 1.11.0
 description: >
   QQ bot via the OneBot 11 protocol — compatible with NapCat, Lagrange,
   LLOneBot, go-cqhttp, SnowLuma. Reverse-WebSocket server or forward
@@ -57,6 +57,10 @@ config_schema:
   outbound_image_max_bytes: {type: int, default: 8388608, label: "卡片 PNG 上限（字节）"}
   image_max_size: {type: int, default: 1536, label: "入站图片长边上限（px）",
     description: "0 保持原样"}
+  image_attach_max: {type: int, default: 3, label: "每条消息单独附的照片数上限",
+    description: "其余照片与表情包进拼图"}
+  image_grid: {type: bool, default: true, label: "多图拼成编号网格",
+    description: "false 时逐张单独附（编号照旧）"}
   max_inbound_file_bytes: {type: int, default: 20971520, label: "入站文件上限（字节）"}
   rate_limit_per_minute: {type: int, default: 30, label: "入站频控（条/分钟/chat）",
     description: "0 关闭"}
