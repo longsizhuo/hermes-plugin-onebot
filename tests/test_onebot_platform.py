@@ -1,8 +1,9 @@
 """Tests for the OneBot 11 platform adapter (NapCat / Lagrange / LLOneBot).
 
-Covers reply splitting at sentence boundaries, CQ-code parsing, mention
-gating, DM/group policies, outbound segment-array payloads, text-image
-rendering, and a live reverse-WS round trip against a fake NapCat client.
+Covers outbound two-tier delivery (single text / t2i card, no auto
+splitting), CQ-code parsing, mention gating, DM/group policies, outbound
+segment-array payloads, text-image rendering, and a live reverse-WS
+round trip against a fake NapCat client.
 """
 
 import asyncio
@@ -29,46 +30,51 @@ from onebot_platform.adapter import (
     render_text_image,
 )
 from onebot_platform import t2i_render
-from onebot_platform.onebot_utils import (
-    DEFAULT_SPLIT_LENGTH,
-    _split_reply,
-)
+from onebot_platform.onebot_utils import _inline_markdown
 
 
 # ---------------------------------------------------------------------------
-# _split_reply
+# _inline_markdown 强调词边界（回移 dsh PR #32 + f809d27）
 # ---------------------------------------------------------------------------
 
 
-def test_split_reply_short_message_unchanged() -> None:
-    assert _split_reply("短消息。", 100) == ["短消息。"]
+def test_inline_markdown_real_emphasis_still_stripped() -> None:
+    """真强调护栏：边界合规的强调照常剥（两端都应通过）。"""
+    assert _inline_markdown("_italic_") == "italic"
+    assert _inline_markdown("__bold__") == "bold"
+    assert _inline_markdown("___粗斜体___") == "粗斜体"
+    assert _inline_markdown("**粗体** 和 *斜体*") == "粗体 和 斜体"
+    assert _inline_markdown("这是 _斜体_ 文字") == "这是 斜体 文字"
+    assert _inline_markdown("（_斜体_）") == "（斜体）"
+    assert _inline_markdown("（__粗体__）") == "（粗体）"
 
 
-def test_split_reply_breaks_at_sentence_boundaries() -> None:
-    text = "第一句完整的话。第二句完整的话！第三句问号？" * 8
-    parts = _split_reply(text, 100)
-    assert len(parts) > 1
-    for part in parts:
-        assert 0 < len(part) <= 100
-        # Every non-final chunk must end on a sentence boundary.
-        assert part[-1] in "。！？!?；;\n"
+def test_inline_markdown_snake_case_and_paths_preserved() -> None:
+    """PR #32 主修：下划线不再改坏 snake_case、路径、URL、常量名。"""
+    assert _inline_markdown("foo_bar_baz.py") == "foo_bar_baz.py"
+    assert _inline_markdown(
+        "https://example.com/a_b_c/d.png"
+    ) == "https://example.com/a_b_c/d.png"
+    assert _inline_markdown("C:\\work_dir\\sub_dir\\x.txt") == "C:\\work_dir\\sub_dir\\x.txt"
+    assert _inline_markdown("用 qq_send_image 发图") == "用 qq_send_image 发图"
+    assert _inline_markdown("SOME_CONST_NAME") == "SOME_CONST_NAME"
+    assert _inline_markdown("`foo_bar_baz.py`") == "foo_bar_baz.py"
+    # 紧贴中文的下划线不再是强调（CommonMark 口径），保持原样。
+    assert _inline_markdown("这是_斜体_文字") == "这是_斜体_文字"
+    assert _inline_markdown("这是__粗体__文字") == "这是__粗体__文字"
+    assert _inline_markdown("报告_第一版_终稿.docx") == "报告_第一版_终稿.docx"
+    # 内容含下划线的伪强调整体保留（旧规则会变成 ab_）。
+    assert _inline_markdown("_a_b_") == "_a_b_"
+    # 同行两处合法强调都剥（旧规则第二个剥不掉）。
+    assert _inline_markdown("_一_ _二_") == "一 二"
 
 
-def test_split_reply_hard_cut_without_boundaries() -> None:
-    text = "x" * 250
-    parts = _split_reply(text, 100)
-    assert [len(p) for p in parts] == [100, 100, 50]
-
-
-def test_split_reply_respects_explicit_newlines() -> None:
-    # Newlines are sentence boundaries: a >limit text full of newlines
-    # breaks at the newlines (each line is short).
-    text = ("行" * 30 + "\n") * 5  # 155 chars, newline every 31 chars
-    parts = _split_reply(text, 100)
-    assert len(parts) >= 2
-    for part in parts[:-1]:
-        assert part.endswith("\n")
-    assert all(len(p) <= 100 for p in parts)
+def test_inline_markdown_star_boundaries_preserved() -> None:
+    """f809d27 主修：星号不再改坏算式，真强调照常剥。"""
+    assert _inline_markdown("3*4*5=60") == "3*4*5=60"
+    assert _inline_markdown("2**3**2=32") == "2**3**2=32"
+    assert _inline_markdown("a ** b") == "a ** b"
+    assert _inline_markdown("**粗体** 和 *斜体* 和 `代码`") == "粗体 和 斜体 和 代码"
 
 
 # ---------------------------------------------------------------------------
@@ -397,20 +403,21 @@ def test_send_uses_segment_array_without_reply() -> None:
     assert all(seg["type"] != "reply" for seg in payload["params"]["message"])
 
 
-def test_send_splits_long_text_into_multiple_messages() -> None:
-    # Disable the text-image path so we exercise the chunking logic.
-    adapter = _make_adapter(split_length=50, text_image_threshold=0)
+def test_send_long_text_delivered_as_single_message() -> None:
+    # 方案 B（dsh b19fa5e 回移）：正文不再按标点分段——卡片路径关闭时，
+    # 超阈值内容也整段单条发送，杜绝词中/URL 被拦腰切断。
+    adapter = _make_adapter(text_image_threshold=0)
     ws = _FakeWS(adapter)
     adapter._ws = ws
     long_text = "第一句。第二句。" * 20  # 160 chars, sentence boundaries
     result = asyncio.run(adapter.send("group:888888", long_text))
     assert result.success
-    assert len(ws.sent) > 1
-    for payload in ws.sent:
-        assert payload["params"]["group_id"] == 888888
-        segs = payload["params"]["message"]
-        assert segs and segs[0]["type"] == "text"
-        assert len(segs[0]["data"]["text"]) <= 50
+    assert len(ws.sent) == 1
+    payload = ws.sent[0]
+    assert payload["params"]["group_id"] == 888888
+    segs = payload["params"]["message"]
+    assert segs and segs[0]["type"] == "text"
+    assert segs[0]["data"]["text"] == long_text
 
 
 def test_send_long_content_uses_text_image(monkeypatch) -> None:
@@ -432,9 +439,10 @@ def test_send_long_content_uses_text_image(monkeypatch) -> None:
     assert segs[0]["data"]["file"].startswith("base64://")
 
 
-def test_send_attaches_media_to_final_chunk() -> None:
-    # 80 chars: >50 (splits) but <150 (no text image).
-    adapter = _make_adapter(split_length=50)
+def test_send_attaches_media_to_text_message() -> None:
+    # 方案 B 后正文只有一条：媒体段直接并到这条消息（旧口径是挂在
+    # 末段文本块上）。
+    adapter = _make_adapter(text_image_threshold=0)
     ws = _FakeWS(adapter)
     adapter._ws = ws
     long_text = "第一句。第二句。" * 10
@@ -447,9 +455,11 @@ def test_send_attaches_media_to_final_chunk() -> None:
     )
     # Missing local file is skipped gracefully; text still delivered.
     assert result.success
-    assert len(ws.sent) > 1
-    for payload in ws.sent:
-        assert all(seg["type"] == "text" for seg in payload["params"]["message"])
+    assert len(ws.sent) == 1
+    segs = ws.sent[0]["params"]["message"]
+    assert segs and segs[0]["type"] == "text"
+    assert segs[0]["data"]["text"] == long_text
+    assert all(seg["type"] == "text" for seg in segs)
 
 
 def test_send_fails_fast_when_disconnected() -> None:
@@ -547,7 +557,11 @@ async def test_reverse_ws_round_trip(monkeypatch) -> None:
                 await asyncio.sleep(0.15)
                 assert received, "private message should be dispatched"
                 ev = received[-1]
-                assert ev.text == "你好😊"
+                # M3-D5：入站内容包 <user_message> 边界（v1.8.0）
+                assert (
+                    ev.text
+                    == '<user_message qq="10001" nickname="测试员">\n你好😊\n</user_message>'
+                )
                 assert ev.source.chat_id == "private:10001"
                 assert ev.source.chat_type == "dm"
 
@@ -592,7 +606,8 @@ async def test_reverse_ws_round_trip(monkeypatch) -> None:
                 await asyncio.sleep(0.15)
                 assert len(received) == before + 1
                 ev = received[-1]
-                assert ev.text.endswith("@123456789 在吗")
+                # 受限标记在边界之外（M3-D5，v1.8.0）
+                assert ev.text.endswith("@123456789 在吗\n</user_message>")
                 assert ev.source.chat_id == "group:888888"
                 assert ev.source.chat_type == "group"
                 assert ev.source.user_name == "卡"  # group card preferred
@@ -1492,6 +1507,32 @@ def test_tools_send_image_builds_media_request(monkeypatch) -> None:
     assert "9" in too_many
 
 
+def test_tools_send_segments_builds_media_request(monkeypatch) -> None:
+    """qq_send_segments（回移 dsh T10 精简版）：工具层校验 + 请求形状。"""
+    from onebot_platform import tools
+
+    calls = []
+
+    def fake_http(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {"ok": True, "message_id": "m2"}
+
+    monkeypatch.setattr(tools, "_http", fake_http)
+    out = tools.qq_send_segments(
+        {"segments": ["第一段", "**第二段**"], "chat_id": "group:888888"}
+    )
+    assert "Sent" in out
+    assert calls[0][0] == "POST"
+    assert calls[0][1] == "/api/send_media"
+    assert calls[0][2]["kind"] == "segments"
+    assert calls[0][2]["segments"] == ["第一段", "**第二段**"]
+    # 校验：空列表 / 全空白段 / 超 9 段 / 超 500 字
+    assert "不能为空" in tools.qq_send_segments({"segments": []})
+    assert "非空文本" in tools.qq_send_segments({"segments": ["   "]})
+    assert "9" in tools.qq_send_segments({"segments": [f"段{i}" for i in range(10)]})
+    assert "500" in tools.qq_send_segments({"segments": ["x" * 501]})
+
+
 def test_tools_napcat_api_whitelist_guard(monkeypatch) -> None:
     from onebot_platform import tools
 
@@ -1703,6 +1744,670 @@ def test_tools_e2e_token_against_api_gate(monkeypatch) -> None:
     assert set(calls) == {"get_group_msg_history"}
 
 
+def test_api_send_media_segments_e2e(monkeypatch) -> None:
+    """端到端：qq_send_segments → /api/send_media(segments) → 逐段 send_msg。
+
+    回移 dsh T10 精简版口径：1–9 段逐条独立气泡、出站同源 strip_markdown
+    清洗、清洗后为空的段按丢弃语义不发送（dsh PR #25）。
+    """
+    import concurrent.futures
+
+    from onebot_platform import tools
+
+    adapter = _make_adapter(access_token="s3cret-token")
+    calls: list = []
+
+    async def fake_call(action, params, timeout=15.0):
+        calls.append((action, params))
+        return {"message_id": len(calls)}
+
+    adapter._call_action = fake_call
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        try:
+            monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "s3cret-token")
+            monkeypatch.setattr(tools, "_BASE", f"http://127.0.0.1:{port}")
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                out = await loop.run_in_executor(
+                    pool,
+                    lambda: tools.qq_send_segments(
+                        {
+                            "segments": ["**第一段**", "~~ ~~", "第二段"],
+                            "chat_id": "group:888888",
+                        }
+                    ),
+                )
+        finally:
+            await runner.cleanup()
+        return out
+
+    out = asyncio.run(run())
+    assert "Sent" in out, f"应发送成功：{out}"
+    # 两条 send_msg（"~~ ~~" 清洗后为空被丢弃），都是群聊目标
+    assert [(a, p.get("group_id")) for a, p in calls] == [("send_msg", 888888)] * 2
+    texts = [p["message"][0]["data"]["text"] for _, p in calls]
+    assert texts == ["第一段", "第二段"]
+
+
+def test_api_send_media_segments_validation(monkeypatch) -> None:
+    """segments 端点层校验：非列表 / 为空 / 超 9 段 / 超 500 字 / 全空清洗 → 400。"""
+    import concurrent.futures
+    import urllib.error
+    import urllib.request
+
+    adapter = _make_adapter(access_token="s3cret-token")
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        base = f"http://127.0.0.1:{port}/api/send_media"
+
+        def post(payload):
+            req = urllib.request.Request(
+                base,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer s3cret-token",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        try:
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                cases = await asyncio.gather(
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": "not-a-list"},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": []},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": [f"段{i}" for i in range(10)]},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": ["x" * 501]},
+                    ),
+                    loop.run_in_executor(
+                        pool, post,
+                        {"chat_id": "group:888888", "kind": "segments", "segments": ["~~ ~~"]},
+                    ),
+                )
+        finally:
+            await runner.cleanup()
+        return cases
+
+    cases = asyncio.run(run())
+    assert [s for s, _ in cases] == [400, 400, 400, 400, 400]
+    assert "must be a list" in cases[0][1]["error"]
+    assert "empty" in cases[1][1]["error"]
+    assert "9" in cases[2][1]["error"]
+    assert "500" in cases[3][1]["error"]
+    assert "markdown strip" in cases[4][1]["error"]
+
+
+# ---------------------------------------------------------------------------
+# P0 批次（v1.6.0 回移）：caption 清洗 / PNG 上限 / 魔数扩展名 / SILK / SSRF
+# ---------------------------------------------------------------------------
+
+
+def test_silk_header_offset_detection() -> None:
+    """SILK v3 魔数判定（dsh PR #29 口径）：允许 0x02/0x03 帧类型前缀。"""
+    from onebot_platform.adapter import _silk_header_offset
+
+    magic = b"#!SILK_V3\n..."
+    assert _silk_header_offset(magic) == 0
+    assert _silk_header_offset(b"\x02" + magic) == 1
+    assert _silk_header_offset(b"\x03" + magic) == 1
+    assert _silk_header_offset(b"\x89PNG\r\n\x1a\n....") == -1
+    assert _silk_header_offset(b"#!SILK_V2") == -1
+    assert _silk_header_offset(b"") == -1
+
+
+def test_sniff_image_ext_by_magic() -> None:
+    """入站图片按文件头定扩展名（dsh PR #11）：GIF/WebP 不再一律 .jpg。"""
+    from onebot_platform.adapter import _sniff_image_ext
+
+    assert _sniff_image_ext(b"\x89PNG\r\n\x1a\nrest") == ".png"
+    assert _sniff_image_ext(b"GIF89a....") == ".gif"
+    assert _sniff_image_ext(b"GIF87a....") == ".gif"
+    assert _sniff_image_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == ".webp"
+    assert _sniff_image_ext(b"\xff\xd8\xff\xe0rest") == ".jpg"
+    assert _sniff_image_ext(b"BM\x36\x00\x00\x00") == ".bmp"
+    assert _sniff_image_ext(b"not an image at all") == ""
+
+
+def test_is_private_ip_and_cidr_allowlist() -> None:
+    """SSRF 闸地址判定（dsh PR #8/#20 口径）：私网/CGNAT/NAT64/mapped 全拦。"""
+    from onebot_platform.adapter import _is_private_ip, _matches_cidr, _parse_cidrs
+
+    for addr in (
+        "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.1.1",
+        "100.64.0.1", "198.18.0.1", "240.0.0.1", "0.1.2.3",
+        "::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1", "64:ff9b::1.2.3.4",
+    ):
+        assert _is_private_ip(addr), addr
+    for addr in ("8.8.8.8", "1.1.1.1", "2606:4700::1111"):
+        assert not _is_private_ip(addr), addr
+    nets = _parse_cidrs(["10.0.0.0/8", "192.168.5.0/24"])
+    assert _matches_cidr("10.1.2.3", nets)
+    assert _matches_cidr("192.168.5.77", nets)
+    assert not _matches_cidr("8.8.8.8", nets)
+    with pytest.raises(ValueError, match="allow_cidrs"):
+        _parse_cidrs(["not-a-cidr"])
+
+
+def test_assert_downloadable_url_blocks_private(monkeypatch) -> None:
+    """下载闸：IP 字面量私网直拒、DNS 解析到私网直拒、白名单/总开关放行。"""
+    adapter = _make_adapter(allow_cidrs=["10.0.0.0/8"])
+    # IP 字面量私网 → 拒；白名单命中 → 放行
+    with pytest.raises(ValueError, match="private/loopback"):
+        asyncio.run(adapter._assert_downloadable_url("http://192.168.1.1/a.jpg"))
+    asyncio.run(adapter._assert_downloadable_url("http://10.1.2.3/a.jpg"))
+    # 非法协议 → 拒
+    with pytest.raises(ValueError, match="protocol not allowed"):
+        asyncio.run(adapter._assert_downloadable_url("file:///etc/passwd"))
+    # 域名解析到私网 → 拒（mock getaddrinfo，不碰真实网络）
+    async def fake_resolve(host):
+        return ["192.168.1.1"]
+
+    monkeypatch.setattr(adapter, "_resolve_host", fake_resolve)
+    with pytest.raises(ValueError, match="resolves to a private/loopback"):
+        asyncio.run(adapter._assert_downloadable_url("http://cdn.example.com/a.jpg"))
+    # 总开关放行
+    adapter_open = _make_adapter(allow_private_hosts=True)
+    asyncio.run(adapter_open._assert_downloadable_url("http://192.168.1.1/a.jpg"))
+
+
+def test_download_image_refused_private_returns_none() -> None:
+    """闸拒绝时优雅降级为 None（入站占位符路径），不抛出不联网。"""
+    adapter = _make_adapter()
+    assert asyncio.run(adapter._download_image("http://127.0.0.1:9/secret.png")) is None
+
+
+def test_fetch_url_revalidates_each_redirect_hop(monkeypatch) -> None:
+    """重定向逐跳过闸：302 萳到私网时第二跳被拒（防 302 打内网）。"""
+    import aiohttp
+    from aiohttp import web
+
+    from onebot_platform import adapter as adapter_mod
+
+    adapter = _make_adapter()
+    hops: list = []
+
+    async def fake_assert(url: str) -> None:
+        hops.append(url)
+        if len(hops) >= 2:
+            raise ValueError("private/loopback address not allowed (redirect target)")
+
+    monkeypatch.setattr(adapter, "_assert_downloadable_url", fake_assert)
+
+    async def start(request):
+        raise web.HTTPFound("/final")
+
+    async def final(request):
+        return web.Response(body=b"secret")
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/start", start)
+        app.router.add_get("/final", final)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            return await adapter._fetch_url(f"http://127.0.0.1:{port}/start", 10.0, "test")
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run()) is None
+    assert len(hops) == 2, "重定向目标必须重新过闸"
+
+
+def test_send_image_caption_cleaned_and_dropped(monkeypatch) -> None:
+    """回移 PR #25/#28：caption 出站同源清洗；清洗后为空则整段不发送。"""
+    import urllib.request
+
+    adapter = _make_adapter()
+    sent: list = []
+
+    async def fake_call(action, params, timeout=15.0):
+        sent.append(params)
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def run(caption):
+        import concurrent.futures
+
+        runner, port = await _start_api_server(adapter)
+        try:
+            payload = json.dumps(
+                {
+                    "chat_id": "group:888888",
+                    "kind": "image",
+                    "sources": ["http://example.com/a.png"],
+                    "caption": caption,
+                }
+            ).encode()
+
+            def post():
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/send_media",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+
+            # 同步 urllib 放线程池，避免阻塞服务所在的 loop（既有口径）
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return await loop.run_in_executor(pool, post)
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run("**标题**\n正文")) == 200
+    # 一条消息：清洗后的 caption 文本在首位，图片段在后
+    message = sent[0]["message"]
+    assert message[0] == {"type": "text", "data": {"text": "标题\n正文"}}
+    assert message[1]["type"] == "image"
+    # 清洗后为空 → 只有图片段
+    assert asyncio.run(run("~~ ~~")) == 200
+    assert sent[1]["message"][0]["type"] == "image"
+
+
+def test_t2i_card_png_too_large_falls_back(monkeypatch) -> None:
+    """回移 dsh outboundImageMaxBytes：PNG 超限不发送，回退整段单条文本。"""
+    from onebot_platform import adapter as adapter_mod
+
+    def big_render(text, title=None):
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 4096
+
+    monkeypatch.setattr(adapter_mod, "render_text_image", big_render)
+    adapter = _make_adapter(text_image_threshold=10, outbound_image_max_bytes=100)
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+
+    result = asyncio.run(adapter.send("private:1", "很长" * 20))
+    assert result.success
+    assert len(ws.sent) == 1
+    segs = ws.sent[0]["params"]["message"]
+    assert segs[0]["type"] == "text"
+    assert all(seg["type"] != "image" for seg in segs)
+    assert segs[0]["data"]["text"] == "很长" * 20
+
+
+# ---------------------------------------------------------------------------
+# v1.7.0 批次：卡片转文字（#45）/ 表情包占位（#44）/ clarify 钩子 / 频控
+# ---------------------------------------------------------------------------
+
+
+def test_card_from_json_and_xml_readable() -> None:
+    """回移 dsh PR #45：json/xml 卡片段 → [卡片:字段 · 链接]，不再是空占位。"""
+    from onebot_platform.onebot_utils import card_from_json, card_from_xml
+
+    j = '{"meta":{"news":{"desc":"描述","jumpUrl":"https://x.io/a","title":"标题","tag":"分享"}}}'
+    assert card_from_json(j) == "[卡片:分享 · 标题 · 描述 https://x.io/a]"
+    # prompt/desc 兜底 + 无 meta
+    assert card_from_json('{"prompt":"想一想"}') == "[卡片:想一想]"
+    assert card_from_json("not json") == "[卡片]"
+    assert card_from_json({}) == "[卡片]"
+    assert card_from_xml(
+        '<msg brief="摘要"><title>t</title><summary>s</summary><url>https://y.io/b</url></msg>'
+    ) == "[卡片:摘要 · t · s https://y.io/b]"
+    assert card_from_xml("<msg/>") == "[卡片]"
+
+
+def test_card_plain_neutralizes_hostile_fields() -> None:
+    """卡片字段安全化：[]/<> 转全角、控制/格式字符剥离、压单行。"""
+    from onebot_platform.onebot_utils import card_from_json
+
+    j = '{"meta":{"n":{"title":"[图片:x] <user_message> a\\tb","url":"https://x.io/p"}}}'
+    out = card_from_json(j)
+    assert "[图片" not in out and "<user_message>" not in out
+    assert "（图片:x）" in out and "＜user_message＞" in out
+
+
+def test_parse_message_array_sticker_mface_card(monkeypatch) -> None:
+    """段数组路径：sticker/mface 占自己的位置，json 段转可读卡片。"""
+    adapter = _make_adapter()
+
+    async def fake_resolve(url, file):
+        return f"/tmp/fake_{(url or 'x').split('/')[-1]}"
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
+    segments = [
+        {"type": "image", "data": {"url": "https://cdn/aaa111.png", "sub_type": "1"}},
+        {"type": "text", "data": {"text": "看这个"}},
+        {"type": "image", "data": {"url": "https://cdn/bbb222.png"}},
+        {"type": "mface", "data": {"url": "https://cdn/ccc333.png"}},
+        {"type": "mface", "data": {"emoji_id": "9"}},
+        {"type": "json", "data": {"data": '{"meta":{"n":{"title":"卡标题","url":"https://x.io/c"}}}'}},
+    ]
+    text, media, types, _ = asyncio.run(adapter._parse_message_array(segments))
+    assert "[表情包:/tmp/fake_aaa111.png]" in text
+    assert "[图片]" in text
+    assert "[表情包:/tmp/fake_ccc333.png]" in text
+    assert text.count("[表情包]") == 1  # 无 url 的 mface
+    assert "[卡片:卡标题 https://x.io/c]" in text
+    assert len(media) == 3 and all(t == "image" for t in types)
+
+
+def test_parse_content_sticker_cq_path(monkeypatch) -> None:
+    """CQ 字符串路径：sub_type=1 的图片占表情包位置，普通图片仍是 [图片]。"""
+    adapter = _make_adapter()
+
+    async def fake_resolve(url, file):
+        return "/tmp/fake_sticker.png"
+
+    monkeypatch.setattr(adapter, "_resolve_image", fake_resolve)
+    raw = "[CQ:image,sub_type=1,url=https://cdn/s.png][CQ:image,url=https://cdn/p.png]"
+    text, media, types = asyncio.run(adapter._parse_content(raw))
+    assert text == "[表情包:/tmp/fake_sticker.png][图片]"
+    assert media == ["/tmp/fake_sticker.png", "/tmp/fake_sticker.png"]
+    assert types == ["image", "image"]
+
+
+def test_rate_limited_sliding_window_and_notice() -> None:
+    """回移 dsh rateLimitPerMinute：60s 窗口计数、超限丢弃、每窗口一条提示、0 关闭。"""
+    adapter = _make_adapter(rate_limit_per_minute=2)
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+
+    async def body():
+        assert adapter._rate_limited("private:888") is False
+        assert adapter._rate_limited("private:888") is False
+        assert adapter._rate_limited("private:888") is True  # 超限丢弃 + 提示任务
+        assert adapter._rate_limited("private:999") is False  # 独立窗口
+        await asyncio.sleep(0.05)  # 让提示任务跑完
+        # 60s 窗口内第二次超限不再重复提示
+        adapter._rate_limited("private:888")
+        await asyncio.sleep(0.05)
+        return ws.sent
+
+    sent = asyncio.run(body())
+    notices = [
+        p for p in sent
+        if p["params"]["message"][0]["data"]["text"].startswith("⏳")
+    ]
+    assert len(notices) == 1
+    # 0 = 关闭
+    adapter_off = _make_adapter(rate_limit_per_minute=0)
+    for _ in range(5):
+        assert adapter_off._rate_limited("c1") is False
+
+
+def test_send_clarify_records_card_and_retire_recalls() -> None:
+    """宿主 clarify 钩子：QQ 记录提问消息 id，retire 撤回原提问并补通知。"""
+    adapter = _make_adapter()
+    adapter._ws = _FakeWS(adapter)  # send() 先查连接；断言走 _call_action 桩
+    actions: list = []
+
+    async def fake_call(action, params, timeout=10.0):
+        actions.append((action, params))
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def body():
+        result = await adapter.send_clarify(
+            "private:888", "选哪个？", ["方案甲", "方案乙"], "cl-1", "sess-1"
+        )
+        assert result.success
+        assert adapter._clarify_cards["cl-1"] == ("private:888", "1")
+        # 提问卡是编号选项文本（send_msg 为 actions 首条）
+        first = actions[0][1]["message"][0]["data"]["text"]
+        assert "选哪个？" in first and "1. 方案甲" in first
+        # 非点击结束：撤回原提问 + notice 发普通消息
+        await adapter.retire_clarify_card("cl-1", "提问已超时")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(body())
+    assert ("delete_msg", {"message_id": 1}) in actions
+    texts = [
+        p["message"][0]["data"]["text"]
+        for a, p in actions
+        if a == "send_msg" and p.get("message")
+    ]
+    assert any("提问已超时" in t for t in texts)
+
+
+def test_group_approve_known_ref_requires_dm(monkeypatch, tmp_path) -> None:
+    """群聊 + 命中 QQ 申请台账 → 提示去私聊（台账不进群）；未命中 → 透传。"""
+    adapter = _make_request_adapter(monkeypatch, tmp_path)
+    # 台账里造一条已知 flag
+    adapter._requests["flag1"] = {
+        "flag": "flag1", "kind": "friend", "sub_type": "",
+        "status": "pending", "decision": None, "decided_ts": 0.0,
+    }
+    reply = asyncio.run(
+        adapter._handle_local_command("group:888", "group", "888", "/approve flag1")
+    )
+    assert "私聊" in reply
+    # 未命中（宿主审批带参形式）→ None 透传
+    reply = asyncio.run(
+        adapter._handle_local_command("group:888", "group", "888", "/approve session")
+    )
+    assert reply is None
+
+
+# ---------------------------------------------------------------------------
+# v1.8.0 批次：user_message 边界（M3-D5/T9）/ 主动写闸（W2-③）/ segments T14
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_and_sanitize_nickname() -> None:
+    """M3-D5：昵称白名单净化 + 边界包装不可闭合。"""
+    from onebot_platform.onebot_utils import sanitize_nickname, wrap_user_message
+
+    assert sanitize_nickname("卡") == "卡"
+    # 控制字符/换行/XML 字符剥除——不能造前缀行或闭合属性
+    assert sanitize_nickname('a</user_message>\nb"') == "a/user_messageb"
+    assert sanitize_nickname("  a   b  ") == "a b"
+    assert len(sanitize_nickname("x" * 99)) == 32
+    wrapped = wrap_user_message("正文", "10001", '坏"昵称')
+    assert wrapped == '<user_message qq="10001" nickname="坏昵称">\n正文\n</user_message>'
+
+
+def test_strip_boundary_leakage_modes() -> None:
+    """T9/#26：尾部整块回显删除、中段引用保留、游离标签剥离。"""
+    from onebot_platform.onebot_utils import strip_boundary_leakage
+
+    # 尾部整块回显（含内容）→ 删
+    assert strip_boundary_leakage("回复正文\n<user_message qq=\"1\" nickname=\"n\">\n你好\n</user_message>") == "回复正文"
+    # 连续两条尾部回显 → 一并删
+    assert (
+        strip_boundary_leakage(
+            "回复\n<user_message qq=\"1\" nickname=\"n\">\na\n</user_message>\n"
+            "<user_message qq=\"1\" nickname=\"n\">\nb\n</user_message>"
+        )
+        == "回复"
+    )
+    # 中段成对包裹（有意引用）→ 保留内容只去标签
+    assert (
+        strip_boundary_leakage("前 <user_message qq=\"1\" nickname=\"n\">引文</user_message> 后")
+        == "前 引文 后"
+    )
+    # 游离标签
+    assert strip_boundary_leakage("正文 </user_message>") == "正文"
+    # 无边界内容原样
+    assert strip_boundary_leakage("普通回复") == "普通回复"
+
+
+def test_process_message_wraps_inbound_and_keeps_commands_bare(monkeypatch) -> None:
+    """入站 wrap：普通消息进边界；网关命令保持裸文本；受限标记在边界外。"""
+    adapter = _make_adapter(require_mention=False, admin_users=["10001"])
+    received: list = []
+
+    async def fake_handle(ev):
+        received.append(ev)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+
+    async def fake_call(action, params, timeout=10.0):
+        return {}
+
+    adapter._call_action = fake_call
+
+    async def feed(text):
+        await adapter._process_message(
+            {
+                "message_type": "private",
+                "user_id": 10001,
+                "self_id": 999,
+                "raw_message": text,
+                "message": text,
+                "sender": {"nickname": "测试员"},
+            }
+        )
+
+    asyncio.run(feed("普通消息"))
+    asyncio.run(feed("/status"))
+    assert len(received) == 2
+    # 普通消息包边界
+    assert received[0].text.startswith('<user_message qq="10001" nickname="测试员">')
+    assert "普通消息" in received[0].text and received[0].text.endswith("</user_message>")
+    # 网关命令保持裸文本
+    assert received[1].text == "/status"
+
+
+def test_write_gate_minute_and_day() -> None:
+    """回移 dsh W2-③：分钟滑动窗 + 自然日计数；拒绝不占额度；0 关闭。"""
+    adapter = _make_adapter(action_rate_per_minute=2, action_rate_per_day=500)
+    assert adapter._write_gate_reject_reason("private:1", "image") is None
+    assert adapter._write_gate_reject_reason("private:1", "image") is None
+    reason = adapter._write_gate_reject_reason("private:1", "segments")
+    assert reason is not None and "每分钟" in reason
+    # 拒绝不占额度：清掉分钟窗后当天仍可用（day 远未满）
+    adapter._write_action_times.clear()
+    assert adapter._write_gate_reject_reason("private:1", "image") is None
+    # 日配额：伪造当日已用满
+    adapter._write_day_count = 500
+    reason = adapter._write_gate_reject_reason("private:1", "image")
+    assert reason is not None and "今日" in reason
+    # 闸关闭
+    adapter_off = _make_adapter(action_rate_per_minute=0, action_rate_per_day=0)
+    for _ in range(5):
+        assert adapter_off._write_gate_reject_reason("private:1", "image") is None
+
+
+def test_write_gate_endpoint_429_and_audit(monkeypatch, tmp_path) -> None:
+    """/api/send_media 过闸：超限 429 + 审计落 JSONL（allowed/拒绝都有）。"""
+    import concurrent.futures
+    import urllib.error
+    import urllib.request
+
+    adapter = _make_adapter(access_token="s3cret-token", action_rate_per_minute=1)
+
+    async def fake_call(action, params, timeout=10.0):
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def run():
+        runner, port = await _start_api_server(adapter)
+        base = f"http://127.0.0.1:{port}/api/send_media"
+
+        def post():
+            req = urllib.request.Request(
+                base,
+                data=json.dumps(
+                    {"chat_id": "group:888888", "kind": "segments", "segments": ["a", "b"]}
+                ).encode(),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer s3cret-token"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        try:
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                first = await loop.run_in_executor(pool, post)
+                second = await loop.run_in_executor(pool, post)
+        finally:
+            await runner.cleanup()
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert first[0] == 200
+    assert second[0] == 429 and "每分钟" in second[1]["error"]
+    # 审计文件：两次调用各一行
+    from onebot_platform.adapter import _ensure_media_dir
+
+    audit = _ensure_media_dir() / "qq-actions.log"
+    lines = [json.loads(l) for l in audit.read_text().splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert lines[0]["allowed"] is True and lines[1]["allowed"] is False
+
+
+def test_segments_interval_and_disabled(monkeypatch) -> None:
+    """T14：interval_ms 按次覆盖生效（段间 sleep 走可注入 _sleep）；禁用态属性。"""
+    adapter = _make_adapter(access_token="s3cret-token", segments_interval_ms=0)
+    sleeps: list = []
+
+    async def fake_call(action, params, timeout=10.0):
+        return {"message_id": 1}
+
+    adapter._call_action = fake_call
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(adapter, "_sleep", fake_sleep)
+
+    async def run(payload):
+        runner, port = await _start_api_server(adapter)
+
+        def post():
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/send_media",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer s3cret-token"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+
+        try:
+            loop = asyncio.get_running_loop()
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return await loop.run_in_executor(pool, post)
+        finally:
+            await runner.cleanup()
+
+    status = asyncio.run(
+        run({"chat_id": "group:888888", "kind": "segments", "segments": ["a", "b"], "interval_ms": 1200})
+    )
+    assert status == 200
+    assert sleeps == [1.2]
+    # 禁用开关
+    adapter_off = _make_adapter(segments_enabled=False)
+    assert adapter_off._segments_enabled is False
+
+
 async def _start_api_server(adapter):
     """起一个只挂 onebot API 路由的本地服务，返回 (runner, port)。"""
     from aiohttp import web
@@ -1896,7 +2601,7 @@ def test_local_command_id_and_ver(monkeypatch) -> None:
         for p in ws.sent
         if p["action"] == "send_msg"
     ]
-    assert any("onebot-plugin v1.2.0" in t for t in texts)
+    assert any("onebot-plugin v1.10.0" in t for t in texts)
 
 
 def test_local_command_mode_instant_disables_loop_merge(monkeypatch) -> None:
@@ -2438,24 +3143,86 @@ def test_t2i_render_over_limit_raises() -> None:
         render_text_image("超限的行\n" * 400)
 
 
-def test_send_t2i_over_limit_falls_back_to_text_chunks(monkeypatch) -> None:
-    """超限走既有失败回退路径：渲染抛 ValueError → 降级分段纯文本发送，
-    不发送任何图片段。"""
+def test_platform_font_candidates_follow_sys_platform(monkeypatch) -> None:
+    """字体候选按平台切换（v1.5.1 回移 dsh fonts.ts 口径的文件路径版）。"""
+    from onebot_platform import t2i_render as t2i
+
+    monkeypatch.setattr(t2i.sys, "platform", "darwin")
+    mac = t2i._platform_font_paths()
+    assert mac[0] == "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    assert any("PingFang" in p for p in mac)
+    assert "/System/Library/Fonts/Menlo.ttc" in t2i._platform_mono_paths()
+    assert "/System/Library/Fonts/Apple Color Emoji.ttc" in t2i._platform_emoji_paths()
+
+    monkeypatch.setattr(t2i.sys, "platform", "win32")
+    win = t2i._platform_font_paths()
+    assert any("msyh" in p for p in win)
+    assert any("consola" in p for p in t2i._platform_mono_paths())
+    assert all("NotoColorEmoji" in p for p in t2i._platform_emoji_paths())
+
+    monkeypatch.setattr(t2i.sys, "platform", "linux")
+    linux = t2i._platform_font_paths()
+    assert linux[0] == "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    assert "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf" in t2i._platform_emoji_paths()
+
+
+def test_prefer_sc_face_picks_regular_weight() -> None:
+    """SC face 三段优先级：CJK SC → SC+Regular/W3 → 任意 SC；排除繁/港/日/隐藏。"""
+    from onebot_platform.t2i_render import _prefer_sc_face
+
+    # Noto 命名：CJK SC 直取
+    assert _prefer_sc_face(["Noto Sans CJK JP Regular", "Noto Sans CJK SC Regular"]) == 1
+    # Songti/PingFang 命名：避开 Black，取 Regular
+    assert (
+        _prefer_sc_face(["Songti SC Black", "Songti SC Regular", "Songti TC Regular"])
+        == 1
+    )
+    # TC 在前、SC 在后：排除 TC 取 SC
+    assert _prefer_sc_face(["PingFang TC Regular", "PingFang SC Regular"]) == 1
+    # 无 SC 标记（Hiragino Sans GB）：回 0（真实文件里 0 就是 W3 常规字重）
+    assert _prefer_sc_face(["Hiragino Sans GB W3", "Hiragino Sans GB W6"]) == 0
+    # 隐藏 Interface face 即使带 SC 也不当选
+    assert _prefer_sc_face(["Hiragino SC Interface W3", "Hiragino SC W3"]) == 1
+
+
+_APPLE_EMOJI = "/System/Library/Fonts/Apple Color Emoji.ttc"
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists(_APPLE_EMOJI),
+    reason="Apple Color Emoji not available in this environment",
+)
+def test_apple_color_emoji_sbix_bitmap() -> None:
+    """macOS：sbix（Apple Color Emoji）走位图提取，与 CBDT 同一调用面。"""
+    from onebot_platform.t2i_render import _emoji_bitmap
+
+    bm = _emoji_bitmap("🙂", 26)
+    assert bm is not None
+    img, w, h = bm
+    assert w > 0 and h == 26
+    # 非表情码点不走位图路径
+    assert _emoji_bitmap("中", 26) is None
+
+
+def test_send_t2i_over_limit_falls_back_to_single_text(monkeypatch) -> None:
+    """超限走既有失败回退路径：渲染抛 ValueError → 降级整段单条纯文本
+    发送（方案 B：不再分段），不发送任何图片段。"""
     from onebot_platform import adapter as adapter_mod
 
     def boom(text, title=None):
         raise ValueError("rendered height exceeds MAX_RENDER_HEIGHT=8000px")
 
     monkeypatch.setattr(adapter_mod, "render_text_image", boom)
-    adapter = _make_adapter(text_image_threshold=50, split_length=50)
+    adapter = _make_adapter(text_image_threshold=50)
     ws = _FakeWS(adapter)
     adapter._ws = ws
 
     result = asyncio.run(adapter.send("private:1", "很长" * 40))
     assert result.success
-    assert ws.sent, "fallback must still deliver text"
-    for payload in ws.sent:
-        assert all(seg["type"] == "text" for seg in payload["params"]["message"])
+    assert len(ws.sent) == 1, "fallback must deliver the whole text as one message"
+    segs = ws.sent[0]["params"]["message"]
+    assert all(seg["type"] == "text" for seg in segs)
+    assert segs[0]["data"]["text"] == "很长" * 40
 
 
 def test_reverse_server_startup_raises_hostname_without_token() -> None:
@@ -2758,8 +3525,9 @@ def test_reject_group_invite_calls_set_group_add_request(monkeypatch, tmp_path) 
     assert rec["status"] == "processed" and rec["decision"] is False
 
 
-def test_approve_unknown_ref_errors(monkeypatch, tmp_path) -> None:
-    """未知 flag/序号 → 明确报错，不调 API。"""
+def test_approve_unknown_ref_passthrough_gateway(monkeypatch, tmp_path) -> None:
+    """未知 flag/序号 → 返回 None 透传网关（v1.7.0 #17：不再吞宿主
+    exec-approval 的 `/approve [session|always|<id>]`），不调 API。"""
     adapter = _make_request_adapter(monkeypatch, tmp_path)
     actions = []
 
@@ -2768,10 +3536,11 @@ def test_approve_unknown_ref_errors(monkeypatch, tmp_path) -> None:
         return {"status": "ok"}
 
     monkeypatch.setattr(adapter, "_call_action", fake_call_action)
-    reply = asyncio.run(
-        adapter._handle_local_command("private:888", "dm", "888", "/approve 999")
-    )
-    assert "未找到" in reply
+    for probe in ("/approve 999", "/approve session", "/approve always", "/reject 999"):
+        reply = asyncio.run(
+            adapter._handle_local_command("private:888", "dm", "888", probe)
+        )
+        assert reply is None, probe
     assert actions == []
 
 
@@ -3914,6 +4683,57 @@ def test_tools_forward_session_chat(monkeypatch) -> None:
     assert calls[2]["session_chat"] is None
 
 
+def test_tools_session_vars_group_cross_chat_denied(monkeypatch) -> None:
+    """R2 review: set_session_vars 真实绑定群会话 → 显式异 chat_id 发送被拒（跨 chat 防护）。"""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from onebot_platform import tools
+
+    adapter, segs = _media_adapter({"admin_users": [111]})
+    tokens = set_session_vars(platform="onebot", chat_id="group:777", chat_type="group")
+    try:
+        async def run():
+            runner, port = await _start_api_server(adapter)
+            try:
+                monkeypatch.setattr(tools, "_BASE", f"http://127.0.0.1:{port}")
+                # blocking urllib call → off the loop or the server can't answer;
+                # to_thread (not run_in_executor) keeps the session ContextVars
+                result = await asyncio.to_thread(
+                    tools.qq_send_image,
+                    {"sources": ["https://example.com/x.png"], "chat_id": "group:999"},
+                )
+                assert "Send failed" in result
+                assert "cross-chat" in result
+            finally:
+                await runner.cleanup()
+
+        asyncio.run(run())
+    finally:
+        clear_session_vars(tokens)
+    assert segs == []
+
+
+def test_tools_session_vars_default_current_chat(monkeypatch) -> None:
+    """R2 review: QQ 会话内省略 chat_id → 默认发到当前会话。"""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from onebot_platform import tools
+
+    calls = []
+
+    def fake_http(method, path, payload=None):
+        calls.append(payload)
+        return {"ok": True, "message_id": "m1"}
+
+    monkeypatch.setattr(tools, "_http", fake_http)
+    tokens = set_session_vars(platform="onebot", chat_id="private:555", chat_type="private")
+    try:
+        result = tools.qq_send_image({"sources": ["https://example.com/x.png"]})
+    finally:
+        clear_session_vars(tokens)
+    assert calls[0]["chat_id"] == "private:555"
+    assert calls[0]["session_chat"] == "private:555"
+    assert "Sent" in result
+
+
 # ── T11 review #4/#5：绑定安全硬失败 + secret_scope 凭证读取 ────────────────
 
 def test_bind_security_raises_non_loopback_no_token() -> None:
@@ -4256,3 +5076,408 @@ def test_cq_string_pictures_get_marks_in_order(monkeypatch, tmp_path) -> None:
     text, media, types = asyncio.run(adapter._parse_content(raw))
     assert ou.number_pictures(text)[0] == "[表情1]看[图片]"
     assert media == [str(tmp_path / "ok.png")] and types == ["image"]
+
+
+# ---------------------------------------------------------------------------
+# SnowLuma 兼容（T1）：ocr_image URL 优先 / 群文件 get_group_file_url 直链 /
+# bot_status·bot_offline notice 静默
+# ---------------------------------------------------------------------------
+
+
+def test_local_command_ocr_prefers_inbound_image_url(monkeypatch) -> None:
+    """SnowLuma：入站图片有 url 时 /ocr 优先传 url，不读 base64。"""
+    from aiohttp import web
+
+    # 本测试主题是 URL 优先级；本地回环测试服务器经 allow_private_hosts
+    # 放行（SSRF 闸默认会拦 loopback，见 test_assert_downloadable_url_*）。
+    adapter = _make_adapter(admin_users=[123456789], allow_private_hosts=True)
+    ws = _FakeWS(adapter)
+    adapter._ws = ws
+    sent_calls: list = []
+
+    async def fake_call(action, params, timeout=30.0):
+        sent_calls.append((action, params))
+        if action == "ocr_image":
+            assert params["image"].startswith("http://127.0.0.1:")
+            return {"texts": [{"text": "第一行"}]}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+    monkeypatch.setattr(adapter, "_shrink_image", lambda path: None)
+
+    async def fake_base64(path, max_bytes=None):
+        raise AssertionError("_file_to_base64 must not run when a url is cached")
+
+    monkeypatch.setattr(adapter, "_file_to_base64", fake_base64)
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    async def run():
+        app = web.Application()
+
+        async def img(request):
+            return web.Response(body=png, content_type="image/png")
+
+        app.router.add_get("/img.png", img)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            await adapter._process_message(
+                {
+                    "message_type": "private",
+                    "user_id": 123456789,
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {"url": f"http://127.0.0.1:{port}/img.png", "file": "x.png"},
+                        }
+                    ],
+                    "self_id": 123456789,
+                }
+            )
+            await adapter._process_message(
+                {
+                    "message_type": "private",
+                    "user_id": 123456789,
+                    "raw_message": "/ocr",
+                    "message": "/ocr",
+                    "self_id": 123456789,
+                }
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    path = adapter._last_image_path.get("private:123456789", "")
+    assert path and Path(path).exists()
+    assert adapter._image_url_by_path.get(path, "").startswith("http://127.0.0.1:")
+    ocr = [p for a, p in sent_calls if a == "ocr_image"]
+    assert ocr and ocr[0]["image"].startswith("http://127.0.0.1:")
+    texts = [
+        "".join(s.get("data", {}).get("text", "") for s in p[1]["message"])
+        for p in sent_calls
+        if p[0] == "send_msg"
+    ]
+    assert any("OCR 结果" in t and "第一行" in t for t in texts)
+
+
+def _group_file_process(adapter, monkeypatch):
+    """跑一条群聊文件段消息（require_mention 关闭），返回捕获事件列表。"""
+    captured: list = []
+
+    async def fake_handle_message(ev):
+        captured.append(ev)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+    async def run():
+        await adapter._process_message(
+            {
+                "message_type": "group",
+                "group_id": 123456789,
+                "user_id": 123456789,
+                "message": [
+                    {"type": "file", "data": {"file_id": "fid-abc-123", "file": "plan.md", "name": ""}}
+                ],
+                "self_id": 123456789,
+            }
+        )
+
+    asyncio.run(run())
+    return captured
+
+
+def test_group_file_uses_get_group_file_url_direct_link(monkeypatch) -> None:
+    """SnowLuma：群文件优先 get_group_file_url 直链，不调 get_private_file_url。"""
+    adapter = _make_adapter(admin_users=[123456789], require_mention=False)
+    called: list = []
+
+    async def fake_call(action, params, timeout=30.0):
+        called.append((action, params))
+        if action == "get_group_file_url":
+            assert params["group_id"] == 123456789
+            assert params["file_id"] == "fid-abc-123"
+            return {"url": "https://cdn.qq.com/group.md"}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+
+    async def fake_download(url, safe_name, max_bytes):
+        return "/tmp/hermes_onebot/group.md"
+
+    monkeypatch.setattr(adapter, "_download_file_bytes", fake_download)
+    captured = _group_file_process(adapter, monkeypatch)
+    assert captured
+    assert "[文件:/tmp/hermes_onebot/group.md]" in captured[0].text
+    actions = [a for a, _ in called]
+    assert "get_group_file_url" in actions
+    assert "get_private_file_url" not in actions
+
+
+def test_group_file_get_group_file_url_failure_falls_back_to_get_file(monkeypatch) -> None:
+    """SnowLuma：get_group_file_url 失败 → 回退 get_file base64，消息不阻塞。"""
+    adapter = _make_adapter(admin_users=[123456789], require_mention=False)
+
+    async def fake_call(action, params, timeout=30.0):
+        if action == "get_group_file_url":
+            raise RuntimeError("get_group_file_url unsupported")
+        if action == "get_file":
+            return {"base64": "aGVsbG8=", "file_size": 5}
+        return {}
+
+    monkeypatch.setattr(adapter, "_call_action", fake_call)
+    captured = _group_file_process(adapter, monkeypatch)
+    assert captured
+    assert "[文件:" in captured[0].text
+    # T11 review #8: get_file 回退载荷落盘在 plugin-data media 目录
+    assert (
+        str(Path(os.environ["HERMES_HOME"]) / "plugin-data" / "onebot-platform" / "media")
+        in captured[0].text
+    )
+
+
+def test_snowluma_bot_status_and_offline_notices_silently_ignored() -> None:
+    """SnowLuma bot_status/bot_offline：未知 notice_type 静默忽略，不出站不投递。"""
+    adapter = _make_adapter()
+    handled: list = []
+
+    async def fake_handle_message(ev):
+        handled.append(ev)
+
+    adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
+
+    frames = [
+        {"post_type": "notice", "notice_type": "bot_status", "sub_type": "online", "self_id": 10000},
+        {"post_type": "notice", "notice_type": "bot_status", "sub_type": "offline", "self_id": 10000},
+        {"post_type": "notice", "notice_type": "bot_offline", "self_id": 10000},
+    ]
+    for data in frames:
+        sent = asyncio.run(_dispatch_notice_and_collect(adapter, data))
+        assert sent == []
+    assert handled == []
+
+
+# ---------------------------------------------------------------------------
+# v1.9.0 批次：dashboard 设置页（#18 重启）——plugin_api 白名单/脱敏/守卫
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _dashboard_client(monkeypatch, tmp_path):
+    """plugin_api router 的 TestClient：HERMES_HOME 重定向 + extra 预置。
+
+    save_config 被捕获（save_plugin_setting 内部经 config_mod.save_config
+    原子合并落盘）；hub settings 为空 → 生效视图回落 platforms.extra。
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("ONEBOT_ACCESS_TOKEN", raising=False)
+    fake_cfg = {
+        "platforms": {
+            "onebot": {
+                "enabled": True,
+                "extra": {
+                    "mode": "reverse", "host": "127.0.0.1", "port": 8643,
+                    "text_image_threshold": 150, "require_mention": True,
+                    "allow_from": ["10001"], "segments_enabled": True,
+                    "segments_interval_ms": 0,
+                },
+            }
+        }
+    }
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda: fake_cfg
+    )
+    saved_calls: list = []
+
+    def fake_save(cfg, **kwargs):
+        # save_plugin_settings 按键逐次调 save_config——记录全部调用
+        saved_calls.append(json.loads(json.dumps(cfg)))
+
+    monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    yield TestClient(app), saved_calls, plugin_api
+
+
+def test_dashboard_config_schema_view_and_redaction(_dashboard_client) -> None:
+    """GET /config：schema 驱动的生效视图（hub 空时回落 extra/default），
+    凭证脱敏为 has_access_token 布尔（env 未设 → False）。"""
+    client, _, _ = _dashboard_client
+    res = client.get("/config")
+    assert res.status_code == 200
+    cfg = res.json()["config"]
+    assert cfg["mode"] == "reverse" and cfg["port"] == 8643
+    assert cfg["text_image_threshold"] == 150
+    assert cfg["allow_from"] == ["10001"]
+    assert cfg["has_access_token"] is False
+    assert "access_token" not in cfg
+    # schema default 兜底（extra 未设的键）
+    assert cfg["rate_limit_per_minute"] == 30
+    assert cfg["poke_reply"] is False
+
+
+def test_dashboard_config_put_validates_and_saves(_dashboard_client) -> None:
+    """PUT /config：save_plugin_settings 正典写路径（settings 命名空间落盘），
+    未知键/枚举越界/非整数 400。"""
+    client, saved_calls, _ = _dashboard_client
+    ok = client.put("/config", json={"values": {
+        "mode": "forward",
+        "text_image_threshold": 200,
+        "allow_private_hosts": False,
+        "allow_from": ["10001", "10002"],
+        "rate_limit_per_minute": 15,
+    }})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["restart_required"] is True
+    assert body["written"] and set(body["written"]) == {
+        "mode", "text_image_threshold", "allow_private_hosts", "allow_from",
+        "rate_limit_per_minute",
+    }
+    merged: dict = {}
+    for call in saved_calls:
+        merged.update(json.loads(json.dumps(
+            call.get("plugins", {}).get("entries", {}).get("onebot-platform", {}).get("settings", {})
+        )))
+    assert merged["mode"] == "forward"
+    assert merged["text_image_threshold"] == 200
+    assert merged["allow_private_hosts"] is False
+    assert merged["allow_from"] == ["10001", "10002"]
+    assert merged["rate_limit_per_minute"] == 15
+
+    # 未知键 400（schema 外）
+    res = client.put("/config", json={"values": {"evil_key": 1}})
+    assert res.status_code == 400 and "evil_key" in res.json()["detail"]
+    # 枚举越界 400
+    res = client.put("/config", json={"values": {"mode": "sideways"}})
+    assert res.status_code == 400 and "mode" in res.json()["detail"]
+    # 非整数 400
+    res = client.put("/config", json={"values": {"port": "abc"}})
+    assert res.status_code == 400 and "port" in res.json()["detail"]
+    # secret 不走本端点
+    res = client.put("/config", json={"values": {"access_token": "new-token"}})
+    assert res.status_code == 400 and "secret" in res.json()["detail"]
+
+
+def test_dashboard_config_hub_settings_win_over_extra(monkeypatch, tmp_path) -> None:
+    """生效视图优先级：hub settings > platforms.extra > schema default。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "platforms": {"onebot": {"enabled": True, "extra": {
+                "mode": "reverse", "rate_limit_per_minute": 99,
+                "text_image_threshold": 150,
+            }}},
+            "plugins": {"entries": {"onebot-platform": {"settings": {
+                "mode": "forward", "rate_limit_per_minute": 10,
+            }}}},
+        },
+    )
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    cfg = TestClient(app).get("/config").json()["config"]
+    # hub settings 赢 extra
+    assert cfg["mode"] == "forward"
+    assert cfg["rate_limit_per_minute"] == 10
+    # hub 未设 → extra
+    assert cfg["text_image_threshold"] == 150
+    # 都没有 → schema default
+    assert cfg["poke_reply"] is False
+
+
+def test_dashboard_status_uses_live_adapter(monkeypatch) -> None:
+    """GET /status 同进程直取活 adapter：连接态 + 写闸用量，零网络。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(plugin_api._adapter_mod, "_live_adapter", lambda: adapter)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    client = TestClient(app)
+
+    adapter._ws = None
+    body = client.get("/status").json()
+    assert body["running"] is True and body["connected"] is False
+    assert body["write_gate"]["minute_limit"] == 20  # 默认闸
+    adapter._ws = object()
+    body = client.get("/status").json()
+    assert body["connected"] is True
+
+
+def test_dashboard_no_live_adapter_reports_not_running(monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from onebot_platform.dashboard import plugin_api
+
+    monkeypatch.setattr(plugin_api._adapter_mod, "_live_adapter", lambda: None)
+    app = FastAPI()
+    app.include_router(plugin_api.router)
+    body = TestClient(app).get("/status").json()
+    assert body == {"status": "ok", "running": False}
+
+
+def test_adapter_merges_hub_settings_over_extra(monkeypatch, tmp_path) -> None:
+    """adapter.__init__ 读 hub settings（同键优先于 extra）——hub 改了要生效。"""
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    hub = {"rate_limit_per_minute": 7, "require_mention": False,
+           "allow_from": ["555"]}
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: {"plugins": {"entries": {"onebot-platform": {"settings": hub}}}},
+    )
+    adapter = _make_adapter(rate_limit_per_minute=99, require_mention=True)
+    assert adapter._rate_limit_per_minute == 7
+    assert adapter._require_mention is False
+    assert adapter._allow_from == {"555"}
+    # hub 未覆盖的键回落 extra
+    assert adapter._text_image_threshold == 150
+
+
+def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:
+    """守卫（对齐宿主 auth contract 测试）：前端 bundle 不读 session token
+    全局、必须走 SDK.fetchJSON、按 manifest name 调 register。"""
+    bundle = (Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
+    assert "__HERMES_SESSION_TOKEN__" not in bundle, "禁止直接读 token（SDK.fetchJSON 是唯一鉴权面）"
+    assert "SDK.fetchJSON" in bundle or "fetchJSON(" in bundle
+    assert 'register("onebot-platform"' in bundle
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[1] / "dashboard" / "manifest.json").read_text()
+    )
+    assert manifest["name"] == "onebot-platform"
+    assert manifest["entry"] == "dist/index.js" and manifest["api"] == "plugin_api.py"
+
+
+def test_dashboard_frontend_uses_sanctioned_auth_surface() -> None:
+    """守卫（对齐宿主 auth contract 测试）：前端 bundle 不读 session token
+    全局、必须走 SDK.fetchJSON、按 manifest name 调 register。"""
+    bundle = (Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js").read_text()
+    assert "__HERMES_SESSION_TOKEN__" not in bundle, "禁止直接读 token（SDK.fetchJSON 是唯一鉴权面）"
+    assert "SDK.fetchJSON" in bundle or "fetchJSON(" in bundle
+    assert 'register("onebot-platform"' in bundle
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[1] / "dashboard" / "manifest.json").read_text()
+    )
+    assert manifest["name"] == "onebot-platform"
+    assert manifest["entry"] == "dist/index.js" and manifest["api"] == "plugin_api.py"

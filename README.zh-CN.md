@@ -1,12 +1,12 @@
 # QQ（OneBot）
 
-Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot 和 go-cqhttp。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
+Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.github.io/)、[Lagrange](https://github.com/LagrangeDev/Lagrange.Core)、LLOneBot、go-cqhttp 和 [SnowLuma](https://snowluma.github.io/)。跟需要腾讯审核的官方 QQ Bot 平台不同，它用本地桥驱动一个普通 QQ 号，适合个人机器人和官方平台覆盖不到的群。
 
 ```
 用户 (QQ) ←→ NapCat ←→ Hermes onebot 适配器 ←→ Hermes agent
                       ├─ 反向 WS 服务端 / 正向 WS 客户端（自动重连）
                       ├─ 入站：CQ 解析、图片下载、语音转写、引用/转发展开
-                      └─ 出站：分段发送、markdown 剥离、[[qq_forward]]、图/音/视频/文件
+                      └─ 出站：单条/t2i 卡片发送、markdown 剥离、[[qq_forward]]、图/音/视频/文件
 ```
 
 > 运行 `hermes gateway setup` 并选择 **QQ (OneBot)** 有引导式配置。
@@ -16,12 +16,14 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 类别 | 能力 |
 |---|---|
 | 连接 | 反向 WS（NapCat ws-reverse 拨入，默认端口 8643）或正向 WS（拨出，默认 `ws://127.0.0.1:3001`）；断线自动重连 |
-| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件段双通道接收（CDN 直链 `get_private_file_url` + `get_file` base64/url 回退）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
+| 入站 | 私聊/群聊、段数组优先解析（CQ 字符串回退）、CQ 反转义、@/回复触发检测（fail-closed）、**图片四路解析（url/base64/file/hash 经 `get_image`）** + 大图压缩、**按文件头魔数定扩展名 + SSRF 下载闸（拒私网/CGNAT/NAT64，`allow_cidrs` 逃生口）**、**SILK v3 魔数先判再转码**、**QQ 卡片（json/xml 段）转可读文字 `[卡片:标题 · 链接]`**、**表情包（sub_type=1 / mface）占自己的位置并解析本地路径**、**`<user_message>` 提示注入边界（正文+引用展开包边界，昵称白名单净化，模型复述的边界标记出站剥离）**、file/voice/video/face/json/poke 段类型、引用自动取原文（`get_msg`）、**文件解析（群文件 CDN 直链 `get_group_file_url`、私聊 CDN 直链 `get_private_file_url`、`get_file` base64/url 回退）**、**per-chat 入站频控（`rate_limit_per_minute`，60s 滑动窗口）**、bot 自身被戳的 poke notice 轻提示回复（可选，`poke_reply`） |
+| 出站 | 两档发送、**不再自动分段**（≤ 阈值单条文本、超阈值渲染 t2i 卡片）、**卡片 PNG 体积上限回退**、Markdown 剥离为 QQ 纯文本、**复述的 `<user_message>` 边界标记剥离**、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **"本轮进展"小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
+| Dashboard 设置页 | 内置 dashboard 插件（`dashboard/` 三件套）：9120 Webapp 新增「QQ (OneBot)」页签——状态面板（WS 连接态、主动写闸用量）、分组设置表单（连接/策略/发送与频控/segments/高级，白名单键校验、凭证只写不读）、主动写审计查看；写入 `platforms.onebot.extra` 后重启网关生效 |
+| 澄清提问 | 宿主 `clarify` 工具的 QQ 呈现：编号选项卡（回复编号/选项文本/自由作答自动回传，支持 "1, 3" 多选）；超时/会话重置时撤回原提问并补通知（`send_clarify` / `retire_clarify_card` 钩子） |
 | 语音 | ffmpeg 转 16 kHz 单声道 WAV → Hermes STT 管线；无 URL 语音先经 `get_record`（base64）取；失败降级 `[语音]` |
 | 文字图 | AstrBot 风格 t2i 卡片渲染器：标题/粗体/斜体/删除线/引用/列表/代码块/**表格**/行内 code 胶囊/彩色 emoji/中文标点禁则；800px 宽 |
-| 出站 | 按句号分段（默认 ≤100 字/条）、**>150 字渲染 t2i 文字图卡片**、Markdown 剥离为 QQ 纯文本、`[[qq_forward]]` 合并转发（群/私聊）、**loop 中间消息合并+撤回**（回合末 **“本轮进展”小结卡**、撤回限速 60ms）、正在输入提示（仅私聊） |
 | 命令 | 管理员本地斜杠命令：`/ocr` / `/mode` / `/id` / `/ver` / `/approve` / `/reject`；其余斜杠照常流转网关核心 |
-| 工具 | `qq_send_image`（≤9 张，路径或 URL）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media`；`provides_tools` 让 CLI/TUI 也可用 |
+| 工具 | `qq_send_image`（≤9 张，路径或 URL，caption 剥离 Markdown）、`qq_send_voice` / `qq_send_video` / `qq_send_file` / `qq_send_forward`、`qq_send_segments`（显式分条 1–9 段，自行拆好每段；`intervalMs` 按次覆盖呼吸间隔；`segments_enabled` 可下线）、`qq_napcat_api`（15 个白名单 action）、`qq_group_history`；HTTP `/api/napcat` + `/api/send_media` + `/api/write_gate_stats`；`provides_tools` 让 CLI/TUI 也可用 |
 | 权限 | 管理员白名单（`ONEBOT_ALLOWED_USERS`）、dm/group 策略（open/allowlist/disabled）、群聊 @ 门控、受限成员 `[受限用户:仅问答]` 软限制、出站敏感意图审计 |
 | 运维 | 热加载 `onebot_utils.py` / `t2i_render.py`（`extra.hot_reload`，免网关重启）、临时媒体 TTL 清理、启动时 t2i 墨源自检（字体链自测） |
 
@@ -30,7 +32,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 | 项 | 要求 |
 |---|---|
 | Hermes | 网关启用 onebot 平台 |
-| OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp（反向或正向 WebSocket） |
+| OneBot 11 桥 | NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma（反向或正向 WebSocket） |
 | 可选依赖 | Hermes 主机上装 `ffmpeg` 用于语音转写（适配器启动时探测一次，缺失即打 WARNING——装上前语音转文字不可用）；`stt:` 下配置 STT 后端（本地 faster-whisper 首次使用自动下载，或 OpenAI 兼容 API）；文字图卡片需要 CJK 字体（见下） |
 
 ## 安装（独立仓）
@@ -40,7 +42,7 @@ Hermes 通过 **OneBot 11 协议**接入 QQ，兼容 [NapCat](https://napneko.gi
 ### 前置要求
 
 - **Hermes v0.22.2 或更新**——下述插件依赖同意流程自该版本起提供。
-- **一个 OneBot 11 桥**（NapCat / Lagrange / LLOneBot / go-cqhttp），Hermes 可达且指向本插件的监听地址（reverse WS 由桥拨入 `host:port`；forward WS 由插件拨出），桥的 access token 与插件 `access_token` 一致。操作步骤见下方「配置 Hermes」与「NapCat 侧配置（必做）」两节。
+- **一个 OneBot 11 桥**（NapCat / Lagrange / LLOneBot / go-cqhttp / SnowLuma），Hermes 可达且指向本插件的监听地址（reverse WS 由桥拨入 `host:port`；forward WS 由插件拨出），桥的 access token 与插件 `access_token` 一致。操作步骤见下方「配置 Hermes」、「NapCat 侧配置（必做）」与「SnowLuma 接入」三节。
 
 ### 安装
 
@@ -98,7 +100,6 @@ gateway:
         group_policy: open         # open | allowlist | disabled
         group_allow_from: []       # group_policy=allowlist 时的群 id
         admin_users: []            # 管理员；回退到 ONEBOT_ALLOWED_USERS
-        split_length: 100          # 长回复分段字符数
         text_image_threshold: 150  # 更长回复渲染文字图
         image_max_size: 2048       # 入站图片压缩（0 = 保持原样）
         image_attach_max: 3        # 每条消息最多几张照片单独附
@@ -121,13 +122,20 @@ gateway:
 | `group_policy` | `open` | `open` / `allowlist` / `disabled` |
 | `group_allow_from` | `[]` | `group_policy=allowlist` 时的允许群 id |
 | `admin_users` | `[]` | 管理员 QQ id；回退到 `ONEBOT_ALLOWED_USERS` |
-| `split_length` | `100` | 长回复分段阈值 |
-| `text_image_threshold` | `150` | t2i 卡片阈值；`<=0` 关闭卡片路径 |
+| `text_image_threshold` | `150` | t2i 卡片阈值；`<=0` 关闭卡片路径。旧配置里的 `split_length` 键被静默忽略——回复永不分段 |
 | `image_max_size` | `2048` | 入站图片长边上限（px）；`0` 保持原样 |
 | `image_attach_max` | `3` | 每条消息里单独附的照片数上限，其余进拼图 |
 | `image_grid` | `true` | 表情包和超出 `image_attach_max` 的照片拼成一张带编号的网格图；`false` 每张单独附 |
 | `max_inbound_file_bytes` | `20971520`（20 MB） | 入站文件大小上限；超限降级为 `[文件:name]` 标记 |
 | `interim_recall_seconds` | `90` | 未结算 interim 消息的自动撤回超时（`0` 关闭） |
+| `outbound_image_max_bytes` | `8388608`（8 MB） | t2i 卡片 PNG 上限（base64 长度）；超限告警并回退整段单条文本 |
+| `allow_cidrs` | `[]` | SSRF 闸白名单逃生口：列内私网地址仍可下载（如受信任内网协议端）；非法条目拒绝启动 |
+| `allow_private_hosts` | `false` | 整体绕过入站媒体 SSRF 闸（私网/回环/CGNAT/NAT64 过滤）；仅限受信任同机部署 |
+| `rate_limit_per_minute` | `30` | 每 chat 每分钟普通消息上限（60s 滑动窗口）；斜杠命令不计入；超限丢弃、每窗口至多一条提示；`0` 关闭 |
+| `action_rate_per_minute` / `action_rate_per_day` | `20` / `500` | qq_* 工具主动写频控闸（分钟滑动窗 + 自然日计数）；超限 429 拒绝且不占额度；审计落 `media/qq-actions.log`（JSONL）；查询 `GET /api/write_gate_stats`；两者均 `0` 关闭 |
+| `segments_enabled` / `segments_interval_ms` | `true` / `0` | qq_send_segments 开关（false 时工具下线、端点拒绝）与相邻段发送间隔（0–3000ms，工具 `intervalMs` 参数可按次覆盖） |
+
+以上键的官方编辑面是 **桌面/TUI 的 设置→插件**（`config_schema` 声明式表单，secret 存 .env）——保存写入 `plugins.entries.onebot-platform.settings`，同键优先于本表（config.yaml extra 为兼容回退）。Webapp「QQ (OneBot)」页签（默认 `http://<host>:9120`）提供同一份设置的状态面板、表单与审计查看，两条入口写同一存储，保存后重启网关生效。
 | `hot_reload` | `false` | 仅开发用：`onebot_utils.py` / `t2i_render.py` 按 mtime 变化自动 reload（调样式免重启；生产建议关闭，升级时原地写入可能加载半截模块） |
 | `poke_reply` | `false` | bot 自己被戳（`notify/poke` notice）时回复轻提示（`@我` / `/help`）；成员互戳不响应；per-chat 60s 冷却 |
 
@@ -200,6 +208,24 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 > ⚠️ NapCat 与 Hermes **不在同一台机器**时，打开 NapCat 网络设置里的 **「文件转 URL」/ file-to-URL** 开关（`enableLocalFile2Url`）。否则 `get_file` 返回的是容器本地路径，Hermes 够不着，文件消息会退化为 `[文件:name]` 标记而无法下载。
 
+### SnowLuma 接入
+
+[SnowLuma](https://snowluma.github.io/) 是 TS 运行时的 OneBot v11 实现，扩展 action 按 NapCat 命名兼容，适配器可直接对接。两种连接方式：
+
+- **reverse 模式（推荐，SnowLuma 拨入）**：在 SnowLuma 的 WebUI 添加一个 **反向 WebSocket** 客户端：
+  - URL：`ws://<hermes-host>:8643/ws`（SnowLuma 与 Hermes 不在同一台机器时用局域网 IP，别用 `127.0.0.1`）
+  - token：与 Hermes 侧 `access_token` 一致——**两者不在同一台机器时必填**（规则同上方 NapCat）
+- **forward 模式（Hermes 拨出）**：把插件的 `url` 设成 `ws://<snowluma-host>:3001`（SnowLuma 默认 WS 端口；其 HTTP API 在 3000），token 保持一致。
+
+**多账号**：SnowLuma 每个 UIN 一份独立配置，且每个 UIN 默认都占用同一组端口（HTTP 3000 / WS 3001）。请**为每个 UIN 单独加一条反向 WebSocket 连接**（或错开每个账号的端口，再为每个账号各建一条 forward 连接）。
+
+#### 与 SnowLuma 的行为差异
+
+- **`/ocr`**：SnowLuma 的 `ocr_image` 只接受图片 **URL 或已缓存的 `file_id`**。入站图片带原始 URL 时按 URL 传递；仅 base64 的入站图片（无 URL）`/ocr` 可能不支持。
+- **群文件**：SnowLuma 的 `get_file` 仅覆盖图片/语音缓存。群文件优先走 `get_group_file_url(group_id, file_id)` 直链解析，失败回退 `get_file`；私聊文件保持既有 `get_private_file_url` → `get_file` 链路。
+- **视频**：SnowLuma 没有 `get_video_file`；入站视频段无 URL 时照常退化为 `[视频]` 占位。
+- **上下线事件**：SnowLuma 会推送 `notice_type=bot_status`（`sub_type` 为 `online`/`offline`；被踢下线发 `bot_offline`）。适配器对这类未知 notice 静默忽略（仅 debug 日志），无副作用。
+
 ## dm / 群访问策略（配置时选定）
 
 两个策略**首次配置时必须各选一个**。默认值只有在你为每个选了三选一之后才有意义：
@@ -266,21 +292,24 @@ base64 内嵌上报的大于 4 MiB 的帧会被拒收。生产传图以 URL（Na
 
 `require_mention: true`（默认）时机器人在群里只响应显式 @ 或回复**机器人自己发的消息**；回复其他人保持沉默，繁忙群不会被无关回复链误唤醒。被回复消息通过 `get_msg` 判定（与引用取原文共用同一次调用，无额外 API 开销）；无法判定被回复者时——取回失败/超时、原消息已撤回删除、或机器人自身 id 未知——回落为算提及（旧行为），防止撤回消息被回复后永不触发。设为 `false` 则响应每条群消息（很吵，大群不推荐）。未配置 `bot_qq` 时机器人从 OneBot meta 事件学自己的 id，@ 检测不需要额外设置。
 
-## 长回复（三档，全可配置）
+## 长回复（两档，全可配置）
 
-回复长度分三档处理。两个阈值都在平台 `extra` 块里可配（`split_length` 和 `text_image_threshold`）：
+回复长度分两档处理——文本**永不会被拆成多条气泡**（回移自 dsh-onebot 的
+splitLength 拆除，方案 B：标点窗口里没有标点时会把词拦腰切断，中间消息
+还会被拆成逐字同文的重复气泡）。阈值在平台 `extra` 块里可配（`text_image_threshold`）：
 
-- **≤ `split_length`**（默认 100）字：单条文本直接发。
-- **`split_length` 到 `text_image_threshold`**（默认 150）：按句子边界分段为多条（在 `。！？!?；;\n` 处断），句子从不被拦腰截断。
-- **> `text_image_threshold`**：渲染成黑字白底文字图（800px 宽、CJK 字体回退链）单张图片发送。卡片总高上限 8000px——超限中止渲染，回退为分段纯文本（与渲染失败同一路径）。渲染失败回退分段文本。
+- **≤ `text_image_threshold`**（默认 150）字：单条文本直接发。
+- **> `text_image_threshold`**：渲染成黑字白底文字图（800px 宽、CJK 字体回退链）单张图片发送。卡片总高上限 8000px——超限中止渲染，回退为整段单条纯文本（与渲染失败同一路径；不分段）。渲染失败回退单条整段文本。
 
-`text_image_threshold: 0` 关闭图片路径（全部走分段文本）；调高调低两个值可权衡消息条数与卡片渲染。
+`text_image_threshold: 0` 关闭图片路径（全部走单条文本）；调高调低该值可权衡消息条数与卡片渲染。
 
 文字图渲染器是 AstrBot 风格**元素化 Markdown 渲染器**：粗体 / 斜体 / 删除线 / 行内代码 / 代码块 / 标题 / 引用 / 列表和**表格**（AstrBot 自己没有表格元素）全部原生绘制。遵循中文排版规则：标点不落行首（行首禁则）、行内样式整体换行、纯文本里的字面 `\n` 变成真换行（行内代码里变空格，`\\n` 保留）、行内代码用浅蓝胶囊配等宽字体（拉丁/数字）+ 字形级回退（CJK）。知道回复对象昵称时卡片带 AstrBot 风格蓝色顶栏（`To <昵称>`，克莱因蓝 #002FA7，白字为**正文两倍字号**，约 68px 高），与 AstrBot 卡片头部比例一致。
 
 ### 字体依赖（一键安装）
 
 卡片渲染器需要三个字体族（CJK / 等宽 / 彩色 emoji），自动注册自系统；字形缺失会渲染成豆腐块。
+
+**macOS / Windows 无需安装任何字体**——候选链自动命中系统字体（v1.5.1）：macOS 走 Hiragino Sans GB → STHeiti → PingFang（CJK）、Menlo（等宽）、Apple Color Emoji（彩色 emoji，sbix 位图提取）；Windows 走微软雅黑 → 中易宋体 → 黑体（CJK）、Consolas / Cascadia（等宽）。下表适用于 Linux 服务器。
 
 | 依赖 | 提供（自动注册路径） | 用途 |
 |---|---|---|
@@ -300,7 +329,7 @@ macOS 什么都不用装（系统自带的 Hiragino Sans GB / Songti SC、Menlo 
 
 ## Markdown 与语音
 
-- **发送前剥离 Markdown**。QQ 不渲染它，所以 `**粗体**`、标题、列表、表格都转成可读纯文本（标题 → `【…】`、列表 → `•`、表格 → 空格分隔单元格、围栏代码块 → 边框框体）。这发生在分段和文字图渲染之前，图片也是干净的。
+- **发送前剥离 Markdown**。QQ 不渲染它，所以 `**粗体**`、标题、列表、表格都转成可读纯文本（标题 → `【…】`、列表 → `•`、表格 → 空格分隔单元格、围栏代码块 → 边框框体）。这发生在文字图渲染之前，图片也是干净的。强调标记只在词边界处剥（回移 dsh PR #32 / f809d27）：`foo_bar_baz.py`、文件路径、URL、`3*4*5` 原样保留，真强调（`_italic_`、`**粗体**`）照常剥。
 - **入站语音自动转写**：适配器下载语音片段，`ffmpeg` 转 16 kHz 单声道 WAV 后交给 Hermes STT 管线。NapCat 私聊语音常常只有 file hash（无 URL）：适配器先调 OneBot `get_record` 取 base64 音频再走下载→ffmpeg→STT 管线。
 
   STT 用全局 `stt:` 配置（与其他平台同一管线）：`provider: local` 在 Hermes 主机跑 faster-whisper（模型 = `stt.local.model`，默认 `small`，首次自动下载）；`provider: openai` 调 OpenAI 兼容端点（配 `stt.openai.*` + API key）。要求：装了 `ffmpeg`；没有它（或 STT 后端不可用）语音降级为 `[语音]` 标记。适配器启动时会用 `shutil.which` 探测一次 `ffmpeg`，缺失即打 WARNING 并附安装指引——装上前语音转文字不可用。
@@ -317,8 +346,8 @@ macOS 什么都不用装（系统自带的 Hiragino Sans GB / Songti SC、Menlo 
 
 入站 `file` 段走**双通道**解析，容器本地路径不会漏给 agent：
 
-1. **CDN 直链优先**：私聊时适配器调 `get_private_file_url`，直接从 QQ CDN 下载。
-2. **`get_file` 回退**：无直链时（群文件，或 NapCat 没开 file-to-URL 开关），回退 `get_file`，接受 base64 或 http URL。
+1. **CDN 直链优先**：群聊时适配器调 `get_group_file_url(group_id, file_id)`；私聊时调 `get_private_file_url`——两者都直接从 QQ CDN 下载。
+2. **`get_file` 回退**：无直链时（或桥没开 file-to-URL 开关），回退 `get_file`，接受 base64 或 http URL。
 
 下载的文件落在临时媒体目录，消息文本里标注 `[文件:本地路径]` 让 agent 能本地读取，体积受 `max_inbound_file_bytes`（默认 20 MB）限制。超限退化为纯 `[文件:name]` 标记。必须保持路径中立的用户级插件会跳过该标注。
 
@@ -397,7 +426,7 @@ HTTP 等价物：适配器本地 API 的 `GET /api/napcat`（action 代理）和
 
 ## 热加载
 
-通过 `extra.hot_reload: true` 启用（默认**关**，仅开发用）。开启后 `onebot_utils.py`（纯函数：CQ 解析、分段、markdown 剥离、表情映射）和 `t2i_render.py`（文字图渲染器）每次使用都会检测：适配器 stat 文件 mtime，变了就 `importlib.reload`，调样式/规则免网关重启。`adapter.py` 自身的改动仍需重启。
+通过 `extra.hot_reload: true` 启用（默认**关**，仅开发用）。开启后 `onebot_utils.py`（纯函数：CQ 解析、markdown 剥离、表情映射）和 `t2i_render.py`（文字图渲染器）每次使用都会检测：适配器 stat 文件 mtime，变了就 `importlib.reload`，调样式/规则免网关重启。`adapter.py` 自身的改动仍需重启。
 
 ## 隐私与数据
 

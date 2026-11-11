@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
+from gateway.session_context import get_session_env
+
 logger = logging.getLogger(__name__)
 
 _BASE = os.environ.get("ONEBOT_TOOL_BASE", "http://127.0.0.1:8643").rstrip("/")
@@ -46,9 +48,9 @@ def _resolve_chat(chat_id: Optional[str]) -> str:
     """Explicit chat_id → session chat id (QQ-channel only) → error."""
     if chat_id:
         return chat_id
-    platform = os.environ.get("HERMES_SESSION_PLATFORM", "") or ""
+    platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
     if platform.lower() == "onebot":
-        session_chat = os.environ.get("HERMES_SESSION_CHAT_ID", "") or ""
+        session_chat = get_session_env("HERMES_SESSION_CHAT_ID") or ""
         if session_chat:
             return session_chat
     raise ValueError(
@@ -64,10 +66,10 @@ def _session_chat() -> Optional[str]:
     deciding here it forwards the session context and lets the adapter
     enforce cross-chat authorization (``_authorize_cross_chat_send``).
     """
-    platform = os.environ.get("HERMES_SESSION_PLATFORM", "") or ""
+    platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
     if platform.strip().lower() != "onebot":
         return None
-    return (os.environ.get("HERMES_SESSION_CHAT_ID", "") or "").strip() or None
+    return (get_session_env("HERMES_SESSION_CHAT_ID") or "").strip() or None
 
 
 def _access_token() -> str:
@@ -101,6 +103,28 @@ def _access_token() -> str:
     except Exception as e:  # noqa: BLE001 - tools must degrade to no-auth
         logger.debug("[onebot-tools] access_token lookup skipped: %s", e)
     return ""
+
+
+def _segments_enabled() -> bool:
+    """qq_send_segments 插件页开关（extra.segments_enabled，默认开）。
+
+    用 ``load_config_readonly``（只读、无锁、毫秒级）而非
+    ``load_gateway_config``：本函数在网关 discovery 的 deadline worker
+    里被调用（register_tools），完整配置加载在该上下文会超时导致整个
+    插件被静默跳过（v1.8.0 生产事故，#23 节）。读失败按开启处理，端点
+    侧同名校验兜底。
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        platforms = cfg.get("platforms") or {}
+        entry = platforms.get("onebot") or {}
+        extra = entry.get("extra") or {}
+        return bool(extra.get("segments_enabled", True))
+    except Exception as e:  # noqa: BLE001 - tools must degrade to enabled
+        logger.debug("[onebot-tools] segments_enabled lookup skipped: %s", e)
+        return True
 
 
 def _http(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -218,6 +242,35 @@ def qq_send_forward(args: Dict[str, Any], **kw) -> str:
     return _media_result(resp)
 
 
+def qq_send_segments(args: Dict[str, Any], **kw) -> str:
+    """Send several plain-text bubbles in explicit order (you split the text)."""
+    segments = args.get("segments") or []
+    if not isinstance(segments, list) or not segments:
+        return "qq_send_segments: segments must be a non-empty list of strings / segments 不能为空"
+    segments = [s for s in segments if isinstance(s, str) and s.strip()]
+    if not segments:
+        return "qq_send_segments: every segment must be a non-empty string / 每段都需为非空文本"
+    if len(segments) > 9:
+        return "qq_send_segments: at most 9 segments per call / 一次最多 9 段"
+    if any(len(s) > 500 for s in segments):
+        return "qq_send_segments: each segment is at most 500 chars / 每段最多 500 字"
+    chat_id = _resolve_chat(args.get("chat_id"))
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "kind": "segments",
+        "segments": segments,
+        "session_chat": _session_chat(),
+    }
+    # T14：按次 intervalMs 覆盖（0–3000，超界按边界截断；省略用全局配置）
+    if args.get("intervalMs") is not None:
+        try:
+            payload["interval_ms"] = max(0, min(int(args["intervalMs"]), 3000))
+        except (TypeError, ValueError):
+            pass
+    resp = _http("POST", "/api/send_media", payload)
+    return _media_result(resp)
+
+
 def qq_napcat_api(args: Dict[str, Any], **kw) -> str:
     """Proxy a whitelisted NapCat OneBot action."""
     action = str(args.get("action") or "")
@@ -259,6 +312,7 @@ _HANDLERS: Dict[str, Any] = {
     "qq_send_video": qq_send_video,
     "qq_send_file": qq_send_file,
     "qq_send_forward": qq_send_forward,
+    "qq_send_segments": qq_send_segments,
     "qq_napcat_api": qq_napcat_api,
     "qq_group_history": qq_group_history,
 }
@@ -333,6 +387,22 @@ def _schemas() -> Dict[str, Dict[str, Any]]:
             },
             "required": ["nodes"],
         },
+        "qq_send_segments": {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered text bubbles, one send_msg each; 1-9 segments, each <=500 chars and non-empty. Split the text yourself — nothing is split automatically (分段文本列表，按顺序逐条发送；最多 9 段、每段 <=500 字，需自行拆好)",
+                },
+                "intervalMs": {
+                    "type": "integer",
+                    "description": "Optional per-call gap between adjacent bubbles in ms (0-3000, clamped); omitted = plugin config segments_interval_ms, default 0 (相邻段发送间隔，按次覆盖全局配置)",
+                },
+                "chat_id": chat_id,
+            },
+            "required": ["segments"],
+        },
         "qq_napcat_api": {
             "type": "object",
             "properties": {
@@ -363,14 +433,22 @@ _DESCRIPTIONS = {
     "qq_send_video": "Send a video message to a QQ chat (absolute path of a local video file). 发送视频到 QQ 会话。",
     "qq_send_file": "Send a file to a QQ chat (absolute path of a local file). 发送文件到 QQ 会话。",
     "qq_send_forward": "Send a merged forward to a QQ chat (chat-history card of named node messages). 发送合并转发。",
+    "qq_send_segments": "Send several plain-text QQ bubbles in explicit order — use ONLY when you want separate bubbles; you split the text yourself (1-9 segments, each <=500 chars). 按顺序发送多条独立文本气泡（仅明确需要分条呈现时使用，自行拆好每段）。",
     "qq_napcat_api": "Call a whitelisted NapCat OneBot action (member queries / file URLs / OCR / AI etc.). 调用白名单内的 NapCat action。",
     "qq_group_history": "Pull recent QQ group message history for summarization or monitoring. 拉取 QQ 群最近消息历史。",
 }
 
 
 def register_tools(ctx) -> None:
-    """Register the qq_* tools in the ``qq`` toolset."""
+    """Register the qq_* tools in the ``qq`` toolset.
+
+    T14：segments_enabled=false 时 qq_send_segments 不注册（模型不可见即
+    不可用）；端点侧同名拒绝兜底（v1.8.0）。
+    """
     for name, schema in _schemas().items():
+        if name == "qq_send_segments" and not _segments_enabled():
+            logger.info("[onebot-tools] qq_send_segments disabled by config, skipping registration")
+            continue
         ctx.register_tool(
             name=name,
             toolset="qq",

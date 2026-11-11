@@ -1,17 +1,19 @@
 """OneBot 纯逻辑工具模块（可热加载）。
 
-包含与协议状态无关的纯函数/常量：CQ 码解析、Markdown 剥离、长消息
-分段、表情映射、文字图字体链。adapter.py 通过 ``_load_onebot_utils()``
+包含与协议状态无关的纯函数/常量：CQ 码解析、Markdown 剥离、表情映射、
+文字图字体链。adapter.py 通过 ``_load_onebot_utils()``
 按 mtime 热加载本模块——改这里面的规则无需重启 gateway。
 """
 
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
-from typing import Any, List, Optional, Tuple
+import unicodedata
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,9 @@ _CQ_FORWARD_RE = re.compile(r"\[CQ:forward,id=([^,\]]+)\]")
 _CQ_IMAGE_RE = re.compile(r"\[CQ:image,[^\]]*?url=([^,\]]+)\]")
 _CQ_IMAGE_ALL_RE = re.compile(r"\[CQ:image,([^\]]*)\]")
 _CQ_IMAGE_NOURL_RE = re.compile(r"\[CQ:image(?:,[^\]]*)?\]")
+# image|mface 组合（属性可选）：入站编号/拼图管线的一遍扫正则——image 和
+# mface 必须在同一次 finditer 里按出现顺序处理，编号才和附图顺序一致
+_CQ_PICTURE_RE = re.compile(r"\[CQ:(?:image|mface)(?:,([^\]]*))?\]")
 _CQ_RECORD_RE = re.compile(r"\[CQ:record,[^\]]*?url=([^,\]]+)\]")
 _CQ_RECORD_NOURL_RE = re.compile(r"\[CQ:record(?:,[^\]]*)?\]")
 _CQ_RECORD_ALL_RE = re.compile(r"\[CQ:record,([^\]]*)\]")
@@ -31,9 +36,206 @@ _CQ_FACE_RE = re.compile(r"\[CQ:face,id=(\d+)\]")
 # 无 name 参数（标准 OneBot 的 name 在 NapCat 里不出现），文件名取 file= 值
 _CQ_FILE_RE = re.compile(r"\[CQ:file,([^\]]*)\]")
 _CQ_VIDEO_RE = re.compile(r"\[CQ:video(?:,[^\]]*)?\]")
-_CQ_JSON_RE = re.compile(r"\[CQ:json(?:,[^\]]*)?\]")
+_CQ_JSON_RE = re.compile(r"\[CQ:json(?:,([^\]]*))?\]")
+_CQ_XML_RE = re.compile(r"\[CQ:xml(?:,([^\]]*))?\]")
+_CQ_MFACE_RE = re.compile(r"\[CQ:mface(?:,([^\]]*))?\]")
 _CQ_POKE_RE = re.compile(r"\[CQ:poke(?:,[^\]]*)?\]")
 _CQ_ANY_RE = re.compile(r"\[CQ:[^\]]*\]")
+
+
+def _cq_attrs(cq_match: str) -> Dict[str, str]:
+    """解析 [CQ:type,k=v,...] 的属性串（不含 type 部分）；容错无 = 的段。"""
+    attrs: Dict[str, str] = {}
+    for kv in cq_match.split(","):
+        if "=" in kv:
+            k, _, v = kv.partition("=")
+            attrs[k.strip()] = _cq_unescape(v)
+    return attrs
+
+
+# ── QQ 卡片（json/xml 段）转可读文字（回移 dsh PR #45）─────────────────
+# json 段一律 [卡片]、xml 段 [xml]，别人分享的歌/视频/群邀请/小程序内容全丢。
+# 取写给人看的字段和一个 http(s) 链接，写成 [卡片:标题 · 描述 · url]。
+_CARD_TEXT_KEYS = ("tag", "source", "title", "nickname", "name", "desc", "contact", "address", "text", "content")
+_CARD_LINK_KEYS = ("qqdocurl", "jumpUrl", "jumpurl", "jump_url", "doc_url", "url")
+CARD_PLACEHOLDER = "[卡片]"
+_CARD_MAX_FIELD = 160
+_CARD_MAX_TEXT = 360
+_CARD_MAX_FIELDS = 5
+_CARD_MAX_LINK = 200
+# 链接里不允许空白/尖括号/方括号/控制/格式字符（线性扫描，防恶意输入）
+_CARD_LINK_RE = re.compile(
+    r"https?://[^\s<>\"\[\]\x00-\x1f\x7f\u200b-\u200f\u2028\u2029\ufeff]+", re.I
+)
+
+
+def _card_unescape(value: str) -> str:
+    """CQ + XML 转义逐层还原（嵌套 &amp;#91; 一并展开，dsh cardUnescape 口径）。"""
+    return _cq_unescape(re.sub(r"&(?:amp;)+", "&", value or "")).replace(
+        "&lt;", "<"
+    ).replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'")
+
+
+def _card_cap_chars(text: str, max_chars: int) -> str:
+    return text if len(text) <= max_chars else text[:max_chars].rstrip()
+
+
+def _card_plain(value: str) -> str:
+    """卡片字段压成单行安全文本。
+
+    卡片是别人写的：方括号会冒充本插件自己的 [图片:path] 标记抢媒体槽，
+    尖括号会冒充 user_message 边界，控制/格式字符能藏字——全部处理。
+    """
+    chars: List[str] = []
+    for ch in _card_unescape(value):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        if cat == "Cc":
+            chars.append(" ")
+        else:
+            chars.append(ch)
+    flat = (
+        "".join(chars)
+        .replace("<", "＜")
+        .replace(">", "＞")
+        .replace("[", "（")
+        .replace("]", "）")
+    )
+    flat = re.sub(r"\s+", " ", flat).strip()
+    return _card_cap_chars(flat, _CARD_MAX_FIELD)
+
+
+def _card_strings(source: Any, keys) -> List[str]:
+    if not isinstance(source, dict):
+        return []
+    return [source[key] for key in keys if isinstance(source.get(key), str)]
+
+
+def _card_text(fields: List[str], links: List[str]) -> str:
+    kept = list(dict.fromkeys(f for f in fields if f))[:_CARD_MAX_FIELDS]
+    link = next(
+        (u for u in links if len(u) <= _CARD_MAX_LINK and _CARD_LINK_RE.fullmatch(u)), ""
+    )
+    parts = [_card_cap_chars(" · ".join(kept), _CARD_MAX_TEXT), link]
+    body = " ".join(p for p in parts if p)
+    return CARD_PLACEHOLDER if not body else f"[卡片:{body}]"
+
+
+def card_from_json(raw: Any) -> str:
+    """json 卡片段 → [卡片:字段 · 链接]（dsh PR #45 口径）。
+
+    取 meta 首个对象的文本字段，无则再深一层，然后 prompt、desc；
+    链接取 meta 对象（含内层）的跳转键。无可读内容回 [卡片]。
+    """
+    card = raw
+    if isinstance(card, str):
+        try:
+            card = json.loads(card)
+        except Exception:
+            return CARD_PLACEHOLDER
+    if not isinstance(card, dict):
+        return CARD_PLACEHOLDER
+    meta = card.get("meta")
+    block = (
+        next((v for v in meta.values() if isinstance(v, dict)), None)
+        if isinstance(meta, dict)
+        else None
+    )
+    inner = (
+        next((v for v in block.values() if isinstance(v, dict)), None)
+        if isinstance(block, dict)
+        else None
+    )
+
+    def plain(source: Any, keys) -> List[str]:
+        return [t for t in (_card_plain(s) for s in _card_strings(source, keys)) if t]
+
+    for fields in (
+        plain(block, _CARD_TEXT_KEYS),
+        plain(inner, _CARD_TEXT_KEYS),
+        plain(card, ("prompt",)),
+        plain(card, ("desc",)),
+    ):
+        if fields:
+            links = _card_strings(block, _CARD_LINK_KEYS) + _card_strings(inner, _CARD_LINK_KEYS)
+            return _card_text(fields, links)
+    return _card_text([], [])
+
+
+def card_from_xml(raw: Any) -> str:
+    """xml 卡片段 → [卡片:brief/title/summary · url]（dsh PR #45 口径）。
+
+    [^<>]/[^<] 截断保证对恶意输入仍是线性扫描。
+    """
+    if not isinstance(raw, str):
+        return CARD_PLACEHOLDER
+
+    def attr(name: str) -> str:
+        m = re.search(r"(?:\s|^)" + name + r'=(?:"([^"]*)"|\'([^\']*)\')', raw)
+        if not m:
+            return ""
+        return m.group(1) if m.group(1) is not None else (m.group(2) or "")
+
+    def tag(name: str) -> str:
+        m = re.search(r"<" + name + r"\b[^<>]*>([^<]*)</" + name + r">", raw)
+        return m.group(1) if m else ""
+
+    fields = [_card_plain(attr("brief")), _card_plain(tag("title")), _card_plain(tag("summary"))]
+    # 链接：url= 属性与 <url> 标签两种落点都收（属性优先）
+    return _card_text(fields, [attr("url"), tag("url")])
+
+
+# ── <user_message> 提示注入边界（回移 dsh M3-D5 / T9）──────────────────
+def sanitize_nickname(nickname: str) -> str:
+    """昵称白名单净化：剥 C0/C1/DEL 与 XML 五字符 → 空白折叠 → 32 码点截断。
+
+    保证昵称在消息前缀与 <user_message> 边界属性两个落点都不可伪造
+    （换行不能造前缀行/边界、五个 XML 字符不能闭合/拆分/逃逸属性）。
+    """
+    printable = re.sub(r"[\x00-\x1f\x7f-\x9f<>&\"']", "", nickname or "")
+    collapsed = re.sub(r"\s+", " ", printable).strip()
+    return collapsed if len(collapsed) <= 32 else collapsed[:32]
+
+
+def wrap_user_message(content: str, user_id: str, nickname: str) -> str:
+    """把发送方可控内容（正文+引用展开）包进 <user_message> 边界。
+
+    开标签是可信来源标注：qq 属性是协议层 user_id（数字，非发送方文本）；
+    nickname 再次净化，边界对忘了先净化的调用方也保持不可闭合。
+    """
+    return (
+        f'<user_message qq="{user_id}" nickname="{sanitize_nickname(nickname)}">\n'
+        f"{content}\n</user_message>"
+    )
+
+
+_BOUNDARY_TRAILER_RE = re.compile(
+    r"^([\s\S]*\S)\s*<user_message\s[^>]*>[\s\S]*<\/user_message\s*>\s*\Z", re.I
+)
+_BOUNDARY_PAIR_RE = re.compile(r"<user_message\s[^>]*?>([\s\S]*?)<\/user_message\s*>", re.I)
+_BOUNDARY_STRAY_RE = re.compile(r"<\/?user_message(?:\s[^>]*?)?\/?>", re.I)
+
+
+def strip_boundary_leakage(text: str) -> str:
+    """剥离模型复述的 <user_message> 边界（回移 dsh T9/#26）。
+
+    尾部整块回显（含包裹内容）按泄漏整块删除（贪婪前缀一次只吃最后一个
+    回显包裹，循环吃连续回显）；中段成对包裹保留内容（有意引用）；游离
+    标签去掉；收尾折叠 3+ 连续空行。
+    """
+    if not text or not _BOUNDARY_STRAY_RE.search(text):
+        return text
+    cleaned = text
+    while True:
+        previous = cleaned
+        cleaned = _BOUNDARY_TRAILER_RE.sub(r"\1", previous)
+        if cleaned == previous:
+            break
+    cleaned = _BOUNDARY_PAIR_RE.sub(lambda m: m.group(1).strip(), cleaned)
+    cleaned = _BOUNDARY_STRAY_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _cq_file_text(m: "re.Match") -> str:
@@ -61,9 +263,10 @@ def _cq_unescape(s: str) -> str:
     )
 
 
-# ── 长消息分段 ─────────────────────────────────────────────────────────
-DEFAULT_SPLIT_LENGTH = 100
-_SENTENCE_BOUNDS = "。！？!?；;\n"
+# ── 长消息分段（已拆除）───────────────────────────────────────────────
+# 方案 B（dsh b19fa5e 回移）：正文两档化（≤阈值单条 / >阈值 t2i 卡片，
+# 失败回退整段单条），_split_reply/DEFAULT_SPLIT_LENGTH/_SENTENCE_BOUNDS
+# 随之删除——防止文本在标点窗口外被拦腰切断、interim 拆成同文重复气泡。
 
 # ── NapCat API 白名单 ──────────────────────────────────────────────────
 # 权威定义在此；tools.py 经 fallback 导入本常量（生产网关以裸模块方式
@@ -88,40 +291,6 @@ NAPCAT_API_WHITELIST = [
 ]
 
 
-def _split_reply(content: str, limit: int = DEFAULT_SPLIT_LENGTH) -> List[str]:
-    """Split long content into ≤limit-char chunks at sentence boundaries.
-
-    Prefers the nearest sentence-ending punctuation inside the window;
-    falls back to a hard cut at the limit only when a chunk has no
-    boundary at all (keeps progress guaranteed).
-    """
-    if not content:
-        return []
-    if len(content) <= limit:
-        return [content]
-    parts: List[str] = []
-    start = 0
-    n = len(content)
-    while start < n:
-        end = min(start + limit, n)
-        if end >= n:
-            parts.append(content[start:])
-            break
-        window = content[start:end]
-        cut = -1
-        for i in range(len(window) - 1, -1, -1):
-            if window[i] in _SENTENCE_BOUNDS:
-                cut = i
-                break
-        if cut == -1:
-            # No sentence boundary in the window — hard cut to stay bounded.
-            cut = limit - 1
-        parts.append(content[start : start + cut + 1])
-        start = start + cut + 1
-    # Trim stray spaces but keep sentence-boundary newlines intact.
-    return [p.rstrip(" \t") for p in parts if p.strip(" \t")]
-
-
 # ── 表情映射 ───────────────────────────────────────────────────────────
 # A few common QQ faces → emoji; anything else collapses to [表情].
 _FACE_EMOJI = {
@@ -133,14 +302,23 @@ _FACE_EMOJI = {
 
 # ── Markdown 剥离（QQ 不渲染 Markdown）────────────────────────────────
 def _inline_markdown(text: str) -> str:
-    """Strip inline Markdown from a single line (QQ shows raw syntax)."""
+    """Strip inline Markdown from a single line (QQ shows raw syntax).
+
+    强调规则带回移自 dsh-onebot PR #32 + f809d27 的词边界口径：下划线
+    系（``___``/``__``/``_``）边界不接 Unicode 字母/数字/下划线、内容不
+    跨行不跨下划线；星号系（``***``/``**``/``*``）边界不接 ASCII 字母/
+    数字/星号。这样 snake_case、文件路径、URL、``3*4*5`` 不再被改坏，
+    真强调（``_italic_``、``**粗体**``）照常剥。
+    """
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
-    text = re.sub(r"\*{3}(.+?)\*{3}", r"\1", text)
-    text = re.sub(r"_{3}(.+?)_{3}", r"\1", text)
-    text = re.sub(r"\*{2}(.+?)\*{2}", r"\1", text)
-    text = re.sub(r"_{2}(.+?)_{2}", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # 星号系：边界不接 [0-9A-Za-z*]（f809d27）；内容不跨行不跨星号。
+    text = re.sub(r"(?<![0-9A-Za-z*])\*\*\*([^*\n]+?)\*\*\*(?![0-9A-Za-z*])", r"\1", text)
+    text = re.sub(r"(?<![0-9A-Za-z*])\*\*([^*\n]+?)\*\*(?![0-9A-Za-z*])", r"\1", text)
+    text = re.sub(r"(?<![0-9A-Za-z*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![0-9A-Za-z*])", r"\1", text)
+    # 下划线系：边界不接 \\w（字母/数字/下划线，含中文）（PR #32）。
+    text = re.sub(r"(?<!\w)___([^_\n]+?)___(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)__([^_\n]+?)__(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", text)
     text = re.sub(r"~~(.+?)~~", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", text)
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"[\1]", text)
@@ -617,8 +795,26 @@ def make_picture_grid(paths: List[str], labels: List[int]) -> bytes:
     return buf.getvalue()
 
 
-def picture_note(kinds: List[str], alone: List[int], grids: List[List[int]]) -> str:
-    """告诉模型每张附图是什么：拼图在前，单独附的原图在后。"""
+def sticker_path_clause(sticker_paths: Dict[int, str]) -> str:
+    """表情包编号 → 原文件路径的文案片段（编号 = number_pictures 给出的 [表情N]）。
+
+    dsh PR #44 的意图保留：网格格子是低清缩略，模型要按原文件路径引用/取原图
+    时有路可走。"""
+    return "表情原文件路径：" + "、".join(
+        f"[表情{n}] {p}" for n, p in sorted(sticker_paths.items())
+    )
+
+
+def sticker_path_note(sticker_paths: Dict[int, str]) -> str:
+    """不拼图时（单张可拼 / image_grid: false）表情路径的独立尾注。"""
+    return f"（{sticker_path_clause(sticker_paths)}）"
+
+
+def picture_note(
+    kinds: List[str], alone: List[int], grids: List[List[int]],
+    sticker_paths: Optional[Dict[int, str]] = None,
+) -> str:
+    """告诉模型每张附图是什么：拼图在前，单独附的原图在后；有表情包时附原文件路径。"""
     tag = lambda i: f"[{'表情' if kinds[i] == 'sticker' else '图片'}{i + 1}]"
     parts = [
         f"第 {n} 张附图是 {'、'.join(tag(i) for i in g)} 拼成的一张图，格子左上角的数字就是编号"
@@ -626,4 +822,6 @@ def picture_note(kinds: List[str], alone: List[int], grids: List[List[int]]) -> 
     ]
     if alone:
         parts.append(f"{'其余附图' if grids else '附图'}依次是 {'、'.join(tag(i) for i in alone)}")
+    if sticker_paths:
+        parts.append(sticker_path_clause(sticker_paths))
     return f"（{'；'.join(parts)}）"

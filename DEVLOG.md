@@ -39,7 +39,7 @@ NapCat (QQ)  ←— 反向 WS —→  OneBotAdapter (adapter.py)  ←— Hermes 
 | 连接生命周期 | `connect/disconnect`、`_start_reverse_server`、`_connect_forward_once`、`_forward_read_loop`、`_forward_reconnect` | 反向 WS 服务 + 可选正向 WS 连接 + 自动重连 |
 | 入站 | `_handle_frame`、`_process_message`、`_parse_content`、`_parse_message_array` | 段数组优先解析（回退 CQ 字符串），CQ 反转义，图片/语音/视频/引用处理 |
 | 媒体入站 | `_resolve_image`、`_download_image`、`_download_media`、`_download_audio`、`_shrink_image` | url/base64/file/hash 四路取图；图片压缩 ≤2048px；语音下载转 WAV |
-| 出站 | `send`、`_send_media`、`send_image(_file)`、`send_multiple_images`、`send_voice`、`send_video`、`send_document` | 分段、t2i 转图、批量图 ≤9 张、媒体 base64 |
+| 出站 | `send`、`_send_media`、`send_image(_file)`、`send_multiple_images`、`send_voice`、`send_video`、`send_document` | 两档发送（不分段）、t2i 转图、批量图 ≤9 张、媒体 base64 |
 | 扩展 API | `send_typing/stop_typing`（NapCat set_input_status）、`_handle_group_history`（HTTP /api/group_history）、`send_forward_msg`（[[qq_forward]]） | |
 | 回复周期合并 | `_settle_loop_buffer` | loop 中间消息 → 合并转发 + 撤回（见 §5.7） |
 | 引用取图 | `_process_message` 内 get_msg 分支 | 引用消息自动取原文文本 + 图片（见 §5.6） |
@@ -50,8 +50,8 @@ NapCat (QQ)  ←— 反向 WS —→  OneBotAdapter (adapter.py)  ←— Hermes 
 | 函数 | 职责 |
 |---|---|
 | `_cq_unescape` | CQ 反转义（&amp; → &、&#91; → [、&#93; → ]、&#44; → ,） |
-| `_split_reply` / `DEFAULT_SPLIT_LENGTH` / `_SENTENCE_BOUNDS` | 长消息按标点分段（≤100 单条、100–150 分段、>150 转图） |
-| `strip_markdown` / `_inline_markdown` | QQ 不渲染 Markdown，发前剥离（保留 `[[qq_forward]]` 等内部标记） |
+| ~~`_split_reply` / `DEFAULT_SPLIT_LENGTH` / `_SENTENCE_BOUNDS`~~ | **v1.5.0 已删除**（方案 B 拆除分段，见 §14） |
+| `strip_markdown` / `_inline_markdown` | QQ 不渲染 Markdown，发前剥离（保留 `[[qq_forward]]` 等内部标记；v1.5.0 起强调规则带回移 dsh PR #32 + f809d27 词边界） |
 | `_FACE_EMOJI` | QQ 表情 id → emoji 映射表 |
 | `_ttc_sc_index` / `_build_font_chain` | Noto CJK ttc 简体索引 + 字体回退链 |
 | `_build_chat_id` / `_split_chat_id` | chat_id 编解码（private:123456789 / group:123456789） |
@@ -494,18 +494,371 @@ onebot 插件自 hermes-agent fork 插件线（feat/onebot-platform-v0.22.2，�
 
 ---
 
-## 17. 入站多图编号 + 拼图（2026-10-22）
+## 17. T2：Teknium 二轮评审 3 项修复 + 会话绑定测试（2026-10-26，v1.3.0）
 
-一条消息（含被引用的那条）里有多张图时，原来每张都单独下载、单独附给模型：9 个表情包 = 读 9 张图；文本里全是同样的 `[图片]`，模型分不清哪句话对应哪张；商城表情 `mface` 段直接被忽略。
+上游 PR #140979 二轮评审（teknium1，钉在 commit 88bdc278）给出 2 项阻塞 + 1 项建议，本节逐项落地；版本 1.2.0→1.3.0（PLUGIN_VERSION 与 plugin.yaml 同步）。
 
-### 改动
+### Review 逐项处置
 
-- **编号**：解析段数组 / CQ 码时，下载成功的图先放占位字符（照片 / 表情包两种），组事件前 `onebot_utils.number_pictures` 按文本先后换成 `[图片N]` / `[表情N]`。下载失败的仍是不带编号的 `[图片]` / `[表情]`，所以编号和附图一一对应。表情包 = `sub_type=1` 的图片段 + `mface`（新支持，按 url 下载）。
-- **拼图**：`plan_pictures` 决定哪些单独附：照片前 `image_attach_max`（默认 3）张单独附，表情包和超出的照片每 9 张拼成一张 768px 宽、格子带编号的网格图（`make_picture_grid`）。附图顺序拼图在前、原图在后，文本末尾 `picture_note` 说明每张附图是哪几张。只剩 1 张可拼时直接单独附。`image_grid: false` 回到逐张附（编号照旧）。
-- **引用顺序**：被引用消息的图原来追加在本条之后，而 `[引用]` 文本在前；改为插到前面，编号才对得上。`_last_image_path`（/ocr）在拼图之前记录，仍指向真实图片。
-- adapter.py 只新增 `_budget_pictures` 一个方法和解析处的占位；纯逻辑全部在 onebot_utils.py。
+| # | review 意见 | 落点 | 处置 |
+|---|---|---|---|
+| 1 |【阻塞】tools.py 读 HERMES_SESSION_PLATFORM/HERMES_SESSION_CHAT_ID 用 `os.environ`——gateway 里这些是 context vars，进程内调用（非子进程）时 os.environ 读不到真实会话 | tools.py `_resolve_chat` / `_session_chat` 改 `from gateway.session_context import get_session_env`（drop-in os.getenv：ContextVar 优先→os.environ→default，上游 session_context.py:173） | 返回值语义/strip/默认空串不变；os.environ 兜底保留，CLI/子进程场景行为不变 |
+| 2 |【阻塞】adapter.py 私有路径导入 `from gateway.session import SessionSource` | 改并入既有 `from gateway.platforms.base import ...`（base.py re-export SessionSource，公开入口） | 上游 session 内部模块不再是插件依赖面 |
+| 3 |【建议】adapter.py `__init__` 的 `self._access_token` 只读 extra，未走 tools 同源的 secret_scope 回落链 | 改 `self._access_token = _standalone_access_token(extra)`（复用本文件既有函数，定义于 adapter.py:3051） | 凭证读取与 cron 路径（adapter.py:2952 调用点）、tools._access_token 三处同源 |
+
+### 新增测试
+
+- `test_tools_session_vars_group_cross_chat_denied`：`gateway.session_context.set_session_vars(platform="onebot", chat_id="group:777", chat_type="group")` 真实绑定群会话（非 monkeypatch.setenv），qq_send_image 显式传异 chat_id → adapter 跨 chat 防护 403 拒绝（`Send failed` + `cross-chat`，无消息发出）。测试内 blocking urllib 调用走 `asyncio.to_thread`（既不阻塞 aiohttp 事件循环，又保持 ContextVar 对线程可见；run_in_executor 不传播 contextvars，已验证不可用）。
+- `test_tools_session_vars_default_current_chat`（bonus）：QQ 会话绑定下省略 chat_id → 默认发到当前会话（chat_id 与 session_chat 均为绑定值）。
+- 收尾 `clear_session_vars(tokens)` 清理，避免污染其他用例；既有 `/ver` 断言同步 v1.3.0。
 
 ### 测试
 
-新增 8 用例（编号、拼图分组、网格尺寸/坏图留空、说明文案、截图 + 表情包端到端、`image_grid: false`、引用图在前、CQ 字符串路径失败占位）。本机缺渲染字体，`test_render_text_image_*` / `test_t2i_render_*` 4 例与改动前同样失败（环境原因）；其余 **169 passed**。
+`cd tests && HERMES_AGENT_HOME=<hermes-agent> pytest test_onebot_platform.py -q`：**167 passed**（基线 165 + 新增 2，0 failed）。
 
+---
+
+## 18. 方案 B 回移：拆除出站自动分段 + 强调词边界（2026-11-07，v1.5.0）
+
+接手后的第一项任务：回移 dsh-onebot 的「防止文本被异常分段」实现。dsh 侧
+DEVLOG §2026-09-14（splitLength 拆除，方案 B）+ PR #32 + f809d27。
+
+### 背景（dsh 侧踩过的坑）
+
+- 标点窗口里没有标点时 `_split_reply` 在 limit-1 处硬切，词中/URL 拦腰断
+  （「需要我做什/么直接说」）。
+- 101–150 字符（默认 splitLength=100、threshold=150）区间内容必被拆成 2 条，
+  中间消息逐字同文重复气泡（dsh §2026-09-14 排查定案）。
+- stripMarkdown 强调规则不看词边界，snake_case/路径/URL 被改坏（PR #32），
+  算式 `3*4*5` 被吃掉星号（f809d27）。
+
+### 改动
+
+1. **adapter.py send 出站两档化（方案 B）**：删除 `_split_reply` 调用与
+   `extra.split_length` 读取（旧配置静默忽略，与 dsh zod 非 strict 口径
+   一致）；正文 ≤ `text_image_threshold`（默认 150）单条发送，> 阈值渲染
+   t2i 卡片，卡片失败/超限回退**整段单条**纯文本（不再分段）；媒体段并入
+   唯一文本消息；`_buf_sent_ids` 每次至多 1 条。
+2. **onebot_utils.py**：删除 `_split_reply` / `DEFAULT_SPLIT_LENGTH` /
+   `_SENTENCE_BOUNDS`（留墓碑注释）；`_inline_markdown` 强调规则回移 dsh
+   词边界口径——星号系（`***`/`**`/`*`）边界不接 `[0-9A-Za-z*]`、内容不跨
+   行不跨星号；下划线系（`___`/`__`/`_`）边界不接 `\w`（含中文）、内容不
+   跨行不跨下划线（`_a_b_` 整体保留）。
+3. **PLUGIN_VERSION 1.3.0 → 1.5.0**（顺带修正 v1.4.0 只升 plugin.yaml 未升
+   PLUGIN_VERSION 的漂移；plugin.yaml 同步 1.5.0）。
+4. **文档**：README 中英双语出站行/配置表/长回复章节改两档口径，注明旧
+   `split_length` 静默忽略；plugin.yaml description 去掉「split at sentence
+   boundaries」；DEVLOG §2.1/§2.2 表同步。
+
+### 行为变化（用户可见）
+
+- 100–150 字区间的回复不再拆成两条气泡——单条直接发。
+- t2i 卡片渲染失败/超 8000px 时回退为**一整条**长文本（旧：拆成多条 100 字
+  气泡）。
+- 旧配置里的 `split_length` 键不再生效（静默忽略）。
+- 紧贴中文/字母/数字的下划线与星号不再被当强调剥掉：`报告_第一版_终稿.docx`、
+  `foo_bar_baz.py`、`3*4*5` 原样保留；`_italic_`、`**粗体**` 等真强调照常剥。
+  已知与 dsh 一致的残留：`__init__.py` 仍会变 `init.py`（CommonMark 也算强
+  调，不强求）；行首 `_cache` 与下一行行尾 `class_` 因不跨行不再配对（比
+  CommonMark 更保守，与 dsh 同口径）。
+
+### 测试
+
+- 删 4 条 `_split_reply` 用例；重写 3 条发送用例钉两档行为（160 字关卡片
+  路径恰 1 条消息、媒体并入单条、t2i 超限回退恰 1 条整段文本）；新增 3 条
+  `_inline_markdown` 词边界用例（真强调护栏 / snake_case+路径+URL+CJK /
+  星号算式）。
+- 基线对比：HEAD worktree **167 passed + 4 skipped** vs 改后 **166 passed +
+  4 skipped**（净 -1 = 删 4 增 3，零回归）。两轮均 `HERMES_AGENT_HOME=` 系统
+  hermes-agent（v0.23.0+209.g90d6b98）+ 独立 venv（pytest/pytest-asyncio/
+  websockets/pillow/fonttools/aiohttp/ruamel.yaml——系统 gateway 的 yaml 层
+  是 ruamel.yaml 而非 pyyaml）。
+
+## 19. qq_send_segments 回移（精简版）（2026-11-07，v1.5.0）
+
+补齐 §18 后与 dsh-onebot 仅剩的行为差距：dsh 在方案 B 拆除自动分段后，分条
+呈现的唯一手段是显式工具 `qq_send_segments`（T10/#6，0.9.10）。按用户裁决
+回移**精简版**（不做 T14 的 intervalMs 呼吸间隔与插件页开关）。
+
+### 口径（对齐 dsh）
+
+- 模型显式调用，自行拆好每段：**1–9 段、每段 ≤500 字、不能为空**（空段在
+  过滤后为空即报错，与 dsh `texts.length === 0` throw 一致）。
+- 出站同源清洗（dsh PR #25）：每段过 `strip_markdown`，清洗后为空的段按
+  既有丢弃语义直接不发送，丢弃时打 info 日志（grep `/api/send_media segments`）。
+- 发送：逐段独立 `send_msg`（顺序发送，无间隔——精简版不含呼吸感）；群聊
+  `group_id` / 私聊 `user_id`，`message_id` 返回最后一条。
+- 鉴权/越权：走 `/api/send_media` 既有 `_check_api_auth` +
+  `_authorize_cross_chat_send` 共用闸（无新增攻击面）。
+- 精简版明确不做：`intervalMs` 相邻段间隔、`segments.enabled` 插件页开关。
+
+### 落点
+
+| 文件 | 改动 |
+|---|---|
+| adapter.py | `_handle_send_media` 新增 `kind=segments` 分支（校验/清洗/丢弃日志/逐段发送） |
+| tools.py | `qq_send_segments` handler + schema + 英文优先描述 + `_HANDLERS` 注册 |
+| plugin.yaml | `provides_tools` 追加（CLI/TUI 预载） |
+| README 双语 | 工具行追加 `qq_send_segments` |
+
+### 测试（新增 3，全绿）
+
+- `test_tools_send_segments_builds_media_request`：工具层校验（空/全空白/
+  超 9/超 500）+ `/api/send_media` 请求形状。
+- `test_api_send_media_segments_e2e`：tools → 真实 API 服务 → adapter 桩
+  `_call_action`：3 段（含 `**清洗**` 与 `~~ ~~` 清洗后为空）→ 恰 2 条
+  `send_msg`、群目标、顺序与清洗结果正确。
+- `test_api_send_media_segments_validation`：端点层 5 类 400（非列表/空/
+  超 9/超 500/清洗后全空）。
+
+版本保持 v1.5.0（与 §18 同一批发布）。
+
+## 20. t2i 字体链平台化：macOS/Windows 系统字体自动命中（2026-11-07，v1.5.1）
+
+生产网关（macOS）启动一直报 `t2i ink check FAILED: loaded=[] cjk=False`——
+`_FONT_FALLBACK_PATHS` 只有 Linux 路径，非 Linux 机器上 t2i 卡片档位恒渲染
+失败、走纯文本回退（v1.5.1 前等于卡片功能在这类机器上关闭）。回移 dsh
+fonts.ts 的多平台候选口径为**文件路径版**（本仓是 PIL 按路径探测，非 fontkit
+按族名注册）。
+
+### 改动（t2i_render.py）
+
+| 项 | 口径 |
+|---|---|
+| CJK 链 `_platform_font_paths()` | macOS：Hiragino Sans GB → STHeiti Light/Medium → PingFang（旧版 macOS）→ Songti → Arial Unicode；Windows：msyh.ttc（雅黑）→ simsun → simhei → DENG → simkai → simfang → msjh；Linux：原序不变 |
+| 等宽 `_platform_mono_paths()` | macOS：Menlo → Courier New；Windows：Consolas → Cascadia Code/Mono → Courier New；Linux：不变 |
+| emoji `_platform_emoji_paths()` | macOS：Apple Color Emoji（sbix）→ Noto（CBDT）；其余 Noto |
+| sbix 支持 | Apple Color Emoji 是 sbix 格式：取 ≥64ppem 最小 strike，glyph.imageData 包成 CBDT 式 `data.data`，`_emoji_bitmap` 的 PNG 魔数搜索零改动复用；COLR（Segoe UI Emoji）位图外格式跳过 |
+| `_prefer_sc_face()`（新，可单测） | ttc face 三段优先级：CJK SC（Noto）→ SC+Regular/W3（避开 Songti SC Black 等重字重）→ 任意 SC 排除 TC/HK/JP/Mono/隐藏 Interface；无 SC 标记回 0（Hiragino 0=W3 ✓） |
+
+### 验证（本机 macOS 27）
+
+- `ink_check()`：ok=True、cjk=True、loaded 6 字体（Hiragino 首位）。
+- 真实渲染 PNG（标题/粗体/行内 code/彩色 🙂/表格）目检通过。
+- 测试 +3：平台候选函数（monkeypatch sys.platform 三平台）、_prefer_sc_face
+  优先级矩阵、Apple Color Emoji 位图（存在才跑）；**172 passed + 4 skipped**
+  （169 + 3，零回归）。
+
+### 已知限制
+
+- Windows 无彩色 emoji 候选（Segoe UI Emoji 是 COLRv1，PIL/fontTools 位图路
+  径出不了）→ emoji 走 CJK 链字形，与 base 行为一致。
+- Linux CI / 容器行为零变化（候选序与文件完全同前）。
+
+版本 1.5.0 → 1.5.1（plugin.yaml / PLUGIN_VERSION / /ver 断言三处同步）。
+
+## 21. P0 批次回移：caption 清洗 / PNG 上限 / 魔数扩展名 / SILK / SSRF（2026-11-07，v1.6.0）
+
+差距盘点（对照 dsh 源码逐项核实）后用户裁决先做 P0 五项。
+
+### 逐项
+
+| # | 项 | 来源 | 落点 |
+|---|---|---|---|
+| 1 | qq_send_image caption 出站同源清洗 + **顺手修复 caption 被静默丢弃的 bug**（`/api/send_media` image 分支从未把 payload.caption 传给 send_multiple_images） | PR #25/#28 | 端点清洗（strip_markdown，空则不发送）+ `send_multiple_images(caption=)` 新参，caption 附着首条消息开头（dsh 同形状），>9 张分批时只随首条 |
+| 2 | t2i 卡片 PNG 体积上限：b64 长度 > `outbound_image_max_bytes`（默认 8MB）→ WARNING + 回退整段单条文本 | outboundImageMaxBytes | send() t2i 块 |
+| 3 | 入站图片扩展名按文件头魔数（PNG/GIF/WebP/JPG/BMP），Content-Type 兜底——GIF/WebP 表情不再一律存 .jpg | PR #11 | `_sniff_image_ext()` + `_download_image` |
+| 4 | SILK v3 魔数先判：命中剥 0x02/0x03 帧类型前缀字节、落 `.silk` 扩展名再交 ffmpeg；非 SILK 维持 `.bin` 内容探测（本仓 .bin 路径本无 dsh 那个 .mp3 强制解 bug，此项补前缀容忍 + 确定性探测） | PR #29 | `_silk_header_offset()` + `_download_audio` |
+| 5 | 入站媒体下载 SSRF 闸：仅 http(s)；IP 字面量私网直拒，域名 DNS 全记录逐个判；拦 v4 私网/回环/link-local/CGNAT(100.64/10)/benchmark(198.18/15)/TEST-NET/reserved(240/4)，v6 `::1`/NAT64(64:ff9b::/32)/link-local(fe80::/10)/ULA(fc00::/7)/IPv4-mapped（取内嵌 v4 再判）；**手动跟随重定向并逐跳重过闸**（防 302 打内网）；`extra.allow_cidrs` 白名单逃生口（非法条目 fail-loud 拒绝启动）、`extra.allow_private_hosts` 总开关（默认关）。四个下载函数（image/voice/media/file）全走 `_fetch_url`；base64:// 不经闸 | PR #8/#20 | `_assert_downloadable_url` / `_fetch_url` / `_is_private_ip` / `_parse_cidrs` |
+
+说明：dsh PR #21 的 fileRefRoots 不适用——本仓入站不处理 file:// URL（下载闸直接拒非 http(s)）；#22 的体积上限本仓已有（IMAGE_MAX_BYTES / MEDIA_MAX_BYTES / `_max_inbound_file_bytes`）。
+
+### 测试（新增 8，全绿）
+
+`_silk_header_offset` / `_sniff_image_ext` / `_is_private_ip`+`_parse_cidrs`+`_matches_cidr` / `_assert_downloadable_url`（字面量/DNS mock/白名单/总开关/协议拒绝）/ `_download_image` 拒绝降级 / `_fetch_url` 重定向逐跳过闸（本地 302 服务器实证）/ caption 清洗+空丢弃（端到端）/ PNG 超限回退。**180 passed + 4 skipped**（172 + 8，零回归；`test_local_command_ocr_prefers_inbound_image_url` 因 SSRF 闸拦 loopback 改 `allow_private_hosts=True`——其主题是 URL 优先级）。
+
+新配置键：`outbound_image_max_bytes`（默认 8388608）、`allow_cidrs`（[]）、`allow_private_hosts`（false）。版本 1.5.1 → 1.6.0。
+
+## 22. P1 批次回移：卡片转文字 / 表情包占位 / clarify 钩子 / 入站频控（2026-11-07，v1.7.0）
+
+接用户指示「P1/P2 参考宿主已有实现，不要重复做」——先对照 hermes-agent
+宿主源码重盘差距（见 §21 后的调研），P2 大件大幅缩水/撤销后执行本批。
+
+### 宿主对照结论（决定本批形状）
+
+- **宿主有原生 `clarify` 工具**（tools/clarify_gateway + 平台钩子
+  `send_clarify`/`retire_clarify_card` + inbound text-intercept 自动捕获
+  回复）→ dsh ask-tool.ts 的从零桥不搬，只做 QQ 呈现层（#13 缩水）。
+- **宿主没有 plan mode**（exit_plan_mode 是 dsh 宿主概念）→ dsh card-relay
+  的计划卡部分整体撤销；提问卡被 clarify 覆盖。
+- **宿主原生命令集**（/new /reset /stop /steer /queue /retry /approve
+  /deny 等）经「其余斜杠流转网关核心」在 QQ 可用 → 命令扩充撤销，转为验证。
+- 验证发现**真 bug**：宿主 exec-approval 让用户回复 `/approve
+  [session|always|<id>]`，而插件把带参 `/approve` 拦为 QQ 好友/群申请审批
+  → 未命中台账时报错吞掉，宿主审批在 QQ 上永远无法批准。修复：未命中
+  QQ 申请台账 → 返回 None 透传网关（裸 /approve 此前已透传）；群聊命中
+  台账仍提示去私聊（台账内容不进群），未命中在群里同样透传。
+
+### 落点
+
+| # | 项 | 落点 |
+|---|---|---|
+| #6 | QQ 卡片（json/xml 段）→ `[卡片:字段 · 链接]`（meta 首对象文本字段→内层→prompt→desc；xml brief/title/summary + url= 属性/`<url>` 标签；字段安全化：[]/<> 转全角、控制/格式字符剥离、长度截断；链接线性扫描防恶意输入）| onebot_utils `card_from_json`/`card_from_xml`/`_card_plain`/`_card_text` + adapter 双解析路径（CQ `_CQ_JSON_RE`/`_CQ_XML_RE` 加属性捕获组；段数组 json/xml 分支） |
+| #7 | 表情包占位：sub_type=1 图片与 mface 段占自己的位置——下载成功 `[表情包:<本地路径>]`、失败 `[表情包]`，不再冒充 [图片]；mface 此前整个被忽略 | onebot_utils `_CQ_MFACE_RE` + adapter CQ 路径（`_CQ_IMAGE_ALL_RE` 统一 sub + span→标签映射）与段数组路径 |
+| #13 | 宿主 clarify 的 QQ 呈现：`send_clarify` override（继承 base 默认渲染 + 记录 clarify_id→(chat_id, message_id)）；`retire_clarify_card`（撤回原提问气泡 + notice 转普通消息） | adapter |
+| #10 | 入站 per-chat 频控：`rate_limit_per_minute`（默认 30，0 关闭），60s 滑动窗口；斜杠命令不计入不受限；超限丢弃 + 每窗口至多一条提示（⏳ 文案）；提示任务持引用防 GC | adapter `_rate_limited`/`_send_rate_notice` + `_process_message` 挂载（admin 本地命令之后、内容构建之前） |
+| #17 | 见上——/approve 透传修复 + 验证宿主命令 fall-through 语义 | `_handle_request_decision`（None=未命中台账透传）、`_handle_local_command` approve 分支重构 |
+
+### 测试（新增 7 + 重钉 1，全绿）
+
+卡片 json/xml 可读性、恶意字段安全化、段数组 sticker/mface/card、CQ 路径
+sticker、频控窗口/提示/0 关闭、clarify 记录+撤回+通知、群聊 approve 台账
+命中私聊提示 vs 未命中透传；`test_approve_unknown_ref_errors` 重钉为
+`test_approve_unknown_ref_passthrough_gateway`（新语义）。**187 passed +
+4 skipped**（180 + 7，零回归）。
+
+新配置键：`rate_limit_per_minute`（默认 30）。版本 1.6.0 → 1.7.0。
+
+### 仍未做（后续裁决）
+
+- #8 `<user_message>` 边界包装+回显剥离（提示注入防御，中）
+- #9 主动写频控闸 actionRatePerMinute/Day（中）
+- #12 qq_send_segments 完整版 intervalMs+开关（小）
+- #15 超时补发 deferred（大，宿主确无对应机制）
+- #18 设置页：先调研 hermes dashboard 是否按插件 config_schema 自动渲染配置页
+
+## 23. 收尾批次：user_message 边界 / 主动写闸 / segments T14（2026-11-07，v1.8.0）
+
+剩余项按用户指示「对照宿主已有实现，不要重复做」逐项处置：#8/#9/#12 实现，
+#15/#18 调研后搁置（宿主已有对应机制 / 无目标 UI）。
+
+### 落点
+
+| # | 项 | 说明 |
+|---|---|---|
+| #8 | `<user_message>` 提示注入边界 | onebot_utils：`sanitize_nickname`（C0/C1/DEL+XML 五字符剥除→空白折叠→32 码点）、`wrap_user_message`（qq 属性为协议层数字 id、nickname 再净化保证边界不可闭合）、`strip_boundary_leakage`（尾部整块回显删除（贪婪前缀循环吃连续回显）/中段成对保留内容/游离标签剥离，dsh T9/#26 正则逐条移植）。adapter：入站 reorder——引用展开→wrap（网关命令保持裸文本、纯媒体不包）→受限标记在边界外；出站 send() 在 strip_markdown 前剥回显；platform_hint 补边界声明与「长回复自动转卡片，勿自行分段」 |
+| #9 | 主动写频控闸 | W2-③：`action_rate_per_minute`（20）/`action_rate_per_day`（500），60s 滑动窗+自然日计数（本地时钟）；挂在 `/api/send_media`（qq_* 工具全 kind 面），拒绝 429 不占额度；审计 `media/qq-actions.log` JSONL（asyncio.Lock 保序，allowed/拒绝都记）；`GET /api/write_gate_stats` 用量快照（T11 同款鉴权） |
+| #12 | segments T14 完整版 | `segments_enabled`（false=工具不注册+端点拒绝）、`segments_interval_ms`（0–3000 默认 0）+ 工具 `intervalMs` 按次覆盖（超界截断）；段间 sleep 走可注入 `adapter._sleep` |
+| #15 | 超时补发 deferred → **搁置** | 宿主 delivery_ledger 已拥有发送失败重投（pending 素发/attempting 带恢复标记/flood_control 由 ledger 等待重投，#91969），且回合完成即投递无超时丢弃面——dsh deferred 的两个职责（回合超时登记补发+发送失败重试）宿主均已覆盖，不重复造 |
+| #18 | 设置页 → **搁置** | webapp dashboard 已弃用（用户确认）；dsh settings-remote 绑定 dsh 宿主专属的 Typert Remote + api-gateway + 设置页 client（cordis.patch.yml 声明），hermes 无对应挂载面。插件配置维持在 config.yaml `extra` 块；待宿主出现新配置 UI 再评估 |
+
+### 测试（新增 6 + 重钉 2，全绿）
+
+wrap/净化、strip 三种模式、入站 wrap+命令裸文本+受限标记在边界外、写闸
+分钟/日/拒绝不占额度/关闭、端点 429+审计 JSONL、segments interval 按次
+覆盖+禁用态；`test_reverse_ws_round_trip` 两处断言重钉（事件文本现在是
+边界包裹形态）、`/ver` v1.8.0。**193 passed + 4 skipped**（187 + 6，零回归）。
+
+新配置键：`action_rate_per_minute`/`action_rate_per_day`/`segments_enabled`/
+`segments_interval_ms`。版本 1.7.0 → 1.8.0。**dsh-onebot 差距清单至此清零**
+（全部回移完成或判定宿主已有/无目标面）。
+
+### v1.8.0 生产事故与修复（同日热修，未提版号前落在本提交）
+
+v1.8.0 部署后网关启动 **onebot 平台静默消失**（"Gateway running with 2
+platform(s)"，'onebot' is not a valid Platform；无任何 loader 告警）。二分
+定位：checkout v1.7.0 恢复 3 平台 → 只回退 tools.py 也恢复 → **元凶是
+register_tools 在 discovery 的 deadline worker 里调用 `load_gateway_config()`**
+（完整配置加载在该上下文超时/失败，插件被静默跳过；`hermes plugins doctor`
+与隔离复现均正常，故只在完整网关里现形）。
+
+修复：`_segments_enabled()` 改用 `load_config_readonly`（只读无锁，宿主
+plugins_loader 在同一上下文读 plugins.load_timeout_seconds 的同款先例）。
+enabled=false 的「工具下线」语义保留（discovery 期跳过注册），端点拒绝兜底
+不变；intervalMs/其余逻辑不动。193 passed + 4 skipped 不变。
+
+教训：工具注册路径（discovery/deadline 上下文）里禁止完整配置加载——只读
+配置用 load_config_readonly。
+
+## 24. Dashboard 设置页（#18 重启）（2026-11-08，v1.9.0）
+
+调研修正：v1.8.0 搁置 #18 的前提（「webapp dashboard 已弃用」）被推翻——
+用户澄清弃用的是早期独立的 `hermes dashboard` 服务模式；现役机制是网关
+webapp listener（`gateway/webapp_listener.py`，config `webapp.enabled`，
+默认 9120，"its dashboard mount serves the Webapp bundle"），且宿主有
+完整的插件 UI 扩展合同（kanban/achievements 先例）。设置页完全落在宿主
+已有扩展面内，零宿主改动。
+
+### 宿主扩展面（调研结论，2026-11-07/08）
+
+- `dashboard/` 三件套：`manifest.json`（tab/entry/api）+ `plugin_api.py`
+  （FastAPI APIRouter → 自动挂 `/api/plugins/<name>/`，auth 中间件 +
+  运行时 disabled 门）+ `dist/index.js`（免构建 IIFE）
+- 前端 SDK `window.__HERMES_PLUGIN_SDK__`：React/hooks、shadcn 原语
+  （Card/Badge/Button/Input/Label/Select/Checkbox/ConfirmDialog/Tabs…）、
+  `fetchJSON`/`authedFetch`（唯一合法鉴权面，宿主 auth-contract 测试强制）、
+  `utils.cn`
+- 后端注册：`window.__HERMES_PLUGINS__.register(manifest.name, Component)`
+- 写路径正典：`hermes_cli.config` 的 `load_config_readonly`/`save_config`
+  （POST /api/model/set 同款）；缺口＝无通用插件 extra 读写端点/自动表单
+  渲染器（memory provider 表单是专用先例）→ 插件自建白名单端点
+
+### 落点
+
+| 文件 | 内容 |
+|---|---|
+| dashboard/manifest.json | tab `/onebot`（after:plugins）+ entry + api |
+| dashboard/plugin_api.py | GET /config（白名单投影 + 凭证脱敏 has_access_token）；PUT /config（白名单/枚举/类型校验 → save_config，restart_required=true）；GET /status（`adapter._live_adapter()` 同进程直取：连接态 + 写闸用量，零网络）；GET /audit（media/qq-actions.log 尾部） |
+| dashboard/dist/index.js | SDK IIFE：状态面板 + 五组表单（连接/策略/发送与频控/segments/高级）+ 保存横幅（重启生效）+ 审计查看；access_token 只写不读 |
+| adapter.py | `_build_adapter` 记弱引用 `_LIVE_ADAPTERS` + `_live_adapter()`（同进程取活实例） |
+
+extra 白名单：str/int/bool/list 四类 24 键 + access_token（只写）。全部在
+adapter.__init__ 读取 → PUT 返回 restart_required，前端横幅提示重启。
+
+### 测试（新增 6，全绿）
+
+config 脱敏/白名单、PUT 校验（未知键/枚举/非整数 400）+ save_config 落盘、
+token 只写不读 roundtrip、status 活实例直取（连接态+写闸默认值）、
+无实例 not running、前端守卫（不读 `__HERMES_SESSION_TOKEN__`、走
+fetchJSON、register 名匹配 manifest）。**199 passed + 4 skipped**
+（193 + 6，零回归；测试 venv 补 fastapi/httpx）。
+
+版本 1.8.1 → 1.9.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
+manifest 四处同步）。
+
+### v1.9.0 部署验证（同日）
+
+- 生产 `hermes plugins update` 再次 git 超时（60s）→ 手动 `git pull --ff-only`
+  立即成功（超时是 update 流程自身的 git 调用问题；遗留一个无害的
+  update-autostash），安装目录到 7b6c8d4
+- 重启后：3 platform(s)、✓ onebot connected、NapCat connected
+- 9120 实测：`/api/dashboard/plugins` 含 onebot-platform（tab /onebot，
+  after:plugins）✓；插件 API 未认证请求正确 401（gated 模式 auth 门生效，
+  `login_url: /login`）✓；端点功能由 6 个单测覆盖（TestClient 直测 router）
+- 用户侧验收路径：浏览器登录 Webapp → 「QQ (OneBot)」页签
+
+## 25. 声明式插件设置（Desktop 设置→插件 hub 对接）（2026-11-08，v1.10.0）
+
+用户实测：Hermes 桌面端的 设置→插件 页显示「还没有插件提供设置」。调研确认
+这是宿主**声明式设置机制**：`plugin.yaml` 的 `config_schema`（key →
+{type, label, description, default?, required?, choices?, secret?, env?}）
+由 `hermes_cli.plugins_settings` 渲染（Desktop hub 经 tui_gateway RPC 读
+`plugin_settings_fields`/写 `save_plugin_settings`），保存落
+`plugins.entries.<id>.settings`（secret 经凭证路由存 .env，env 名 = manifest
+`env:` 或 `<PLUGIN_ID>_<KEY>`）。类型集：str/int/float/bool/list/dict/secret，
+choices 的 string 渲染为 enum。**插件侧零代码——声明即生效。**
+
+### 落点
+
+| 层 | 改动 |
+|---|---|
+| plugin.yaml | `config_schema` 声明 26 键（与 adapter 实际读取键一一对应；access_token 为 type: secret + env: ONEBOT_ACCESS_TOKEN——hub 写 .env，`_standalone_access_token` 回退链可读，闭环） |
+| adapter.py | `_hub_settings()`（模块级，读失败零影响）+ `__init__` 合并：**hub settings 同键优先于 platforms.onebot.extra**（hub 是官方设置面；extra 为兼容回退，README 标注） |
+| dashboard/plugin_api.py | schema 驱动重写：GET /config = 生效视图（settings > extra > default，secret 脱敏）；PUT /config = `save_plugin_settings` 正典写路径（按 schema 校验，secret 拒绝并提示走 hub/.env；整数键前端字符串收敛） |
+| dashboard/dist/index.js | token 输入框移除（badge + 指引），int 字段提交前收敛为数字 |
+
+已知边界：hub 改动仍在 adapter.__init__ 读取——重启网关生效；宿主广播
+`settings.changed` 事件，热应用留待后续（adapter 需逐键重载，非简单 reload）。
+
+### 测试（新增 2 + 重写 5，全绿）
+
+config 生效视图（settings > extra > default 三级优先 + 脱敏）、PUT 正典写
+路径（落 settings 命名空间，save_config 按键多次调用需合并断言）、未知键/
+枚举/非整数/secret 400、status、无实例、前端守卫、adapter hub 合并
+（settings 覆盖 extra，未覆盖键回落）。**200 passed + 4 skipped**（199 + 1
+净增，零回归）。
+
+版本 1.9.0 → 1.10.0（plugin.yaml / PLUGIN_VERSION / /ver / dashboard
+manifest 同步）。
+
+### v1.10.0 桌面端实测（computer-use，2026-11-08）
+
+Hermes 桌面应用重启（重跑插件 discovery）后：设置 → 插件 → onebot-platform
+**渲染完整 config_schema 表单**（26 键：下拉/数字步进/开关/textarea/密码框
+类型全对，Access Token 显示 ".env 存储说明"，Save settings 无改动时禁用），
+侧栏出现「插件 > onebot-platform」子页。当前生效值（来自 platforms.extra）
+正确显示；hub 保存后写 settings 命名空间（同键优先）。插件中心列表同时显示
+目录卡（1.3.0，待 PR #1 合并）与已安装卡（Git v1.10.0）。
+
+注意：**桌面应用需重启**才会重新 discovery 插件 manifest（旧进程内缓存无
+config_schema 时 hub 一直显示空态——这就是用户最初看到的空白）。
